@@ -6,6 +6,7 @@ const int _kPatientTypeId = 10;
 const int _kVoiceRecordingTypeId = 11;
 const int _kReportTypeId = 12;
 const int _kReportStatusTypeId = 13;
+const int _kTemplateTypeId = 15; // bumped: file-only schema
 
 enum ReportStatus { draft, pending, completed }
 
@@ -239,6 +240,53 @@ class PathologyReport {
   }
 }
 
+/// A pathologist-authored report template. The body is a plain-text example
+/// of the desired final report (structure, phrasing, section order). The
+/// report generator uses it ONLY as a formatting reference — content must
+/// still come from the transcript.
+class TemplateDocument {
+  final String id;
+  String name;
+  String label; // free-form category e.g. "CAP · Breast", "Lung Biopsy"
+  String filePath; // absolute path of the stored file under app docs
+  String sourceFileName; // original file name as picked by the user
+  int fileSize; // bytes
+  final DateTime createdAt;
+  DateTime updatedAt;
+
+  TemplateDocument({
+    String? id,
+    required this.name,
+    this.label = '',
+    required this.filePath,
+    required this.sourceFileName,
+    this.fileSize = 0,
+    DateTime? createdAt,
+    DateTime? updatedAt,
+  })  : id = id ?? const Uuid().v4(),
+        createdAt = createdAt ?? DateTime.now(),
+        updatedAt = updatedAt ?? DateTime.now();
+
+  TemplateDocument copyWith({
+    String? name,
+    String? label,
+    String? filePath,
+    String? sourceFileName,
+    int? fileSize,
+  }) {
+    return TemplateDocument(
+      id: id,
+      name: name ?? this.name,
+      label: label ?? this.label,
+      filePath: filePath ?? this.filePath,
+      sourceFileName: sourceFileName ?? this.sourceFileName,
+      fileSize: fileSize ?? this.fileSize,
+      createdAt: createdAt,
+      updatedAt: DateTime.now(),
+    );
+  }
+}
+
 // ─── Hive adapters (hand-written, no code-gen) ─────────────────────────
 
 class PatientAdapter extends TypeAdapter<Patient> {
@@ -321,6 +369,39 @@ class ReportStatusAdapter extends TypeAdapter<ReportStatus> {
   @override
   void write(BinaryWriter writer, ReportStatus obj) {
     writer.writeInt(obj.index);
+  }
+}
+
+class TemplateDocumentAdapter extends TypeAdapter<TemplateDocument> {
+  @override
+  final int typeId = _kTemplateTypeId;
+
+  @override
+  TemplateDocument read(BinaryReader reader) {
+    return TemplateDocument(
+      id: reader.readString(),
+      name: reader.readString(),
+      label: reader.readString(),
+      filePath: reader.readString(),
+      sourceFileName: reader.readString(),
+      fileSize: reader.readInt(),
+      createdAt:
+          DateTime.fromMillisecondsSinceEpoch(reader.readInt(), isUtc: false),
+      updatedAt:
+          DateTime.fromMillisecondsSinceEpoch(reader.readInt(), isUtc: false),
+    );
+  }
+
+  @override
+  void write(BinaryWriter writer, TemplateDocument obj) {
+    writer.writeString(obj.id);
+    writer.writeString(obj.name);
+    writer.writeString(obj.label);
+    writer.writeString(obj.filePath);
+    writer.writeString(obj.sourceFileName);
+    writer.writeInt(obj.fileSize);
+    writer.writeInt(obj.createdAt.millisecondsSinceEpoch);
+    writer.writeInt(obj.updatedAt.millisecondsSinceEpoch);
   }
 }
 

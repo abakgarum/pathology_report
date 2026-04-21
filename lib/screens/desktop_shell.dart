@@ -8,6 +8,7 @@ import '../theme/app_theme.dart';
 import 'guide_screen.dart';
 import 'home_voice_screen.dart';
 import 'reports_list_screen.dart';
+import 'templates_screen.dart';
 import 'voice_report_screen.dart';
 import 'voice_settings_screen.dart';
 
@@ -20,7 +21,7 @@ class DesktopShell extends StatefulWidget {
   State<DesktopShell> createState() => _DesktopShellState();
 }
 
-enum _Tab { home, newReport, reports, guide, settings }
+enum _Tab { home, newReport, reports, templates, guide, settings }
 
 class _DesktopShellState extends State<DesktopShell> {
   _Tab _tab = _Tab.home;
@@ -114,6 +115,8 @@ class _DesktopShellState extends State<DesktopShell> {
         );
       case _Tab.reports:
         return const ReportsListScreen();
+      case _Tab.templates:
+        return TemplatesScreen(onBack: () => _goTo(_Tab.home));
       case _Tab.guide:
         return GuideScreen(onBack: () => _goTo(_Tab.home));
       case _Tab.settings:
@@ -133,6 +136,7 @@ class _DesktopShellState extends State<DesktopShell> {
           _navTile(_Tab.home, Icons.dashboard_rounded, 'Home'),
           _navTile(_Tab.newReport, Icons.mic_rounded, 'New Voice Report'),
           _navTile(_Tab.reports, Icons.folder_rounded, 'Reports'),
+          _navTile(_Tab.templates, Icons.description_rounded, 'Templates'),
           _navTile(_Tab.guide, Icons.menu_book_rounded, 'Guide'),
           _navTile(_Tab.settings, Icons.settings_rounded, 'Settings'),
           const Spacer(),
@@ -275,6 +279,10 @@ class _DesktopShellState extends State<DesktopShell> {
             icon: Icon(Icons.folder_outlined),
             selectedIcon: Icon(Icons.folder_rounded),
             label: 'Reports'),
+        NavigationDestination(
+            icon: Icon(Icons.description_outlined),
+            selectedIcon: Icon(Icons.description_rounded),
+            label: 'Templates'),
         NavigationDestination(
             icon: Icon(Icons.menu_book_outlined),
             selectedIcon: Icon(Icons.menu_book_rounded),

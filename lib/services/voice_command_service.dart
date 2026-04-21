@@ -14,6 +14,13 @@ class VoiceCommandEvent {
   VoiceCommandEvent(this.command, {this.payload = ''});
 }
 
+/// One recognizer result — either a still-growing partial or a finalized chunk.
+class TranscriptUpdate {
+  final String text;
+  final bool isFinal;
+  TranscriptUpdate(this.text, {required this.isFinal});
+}
+
 /// One line of diagnostic log.
 class VoiceLogLine {
   final DateTime time;
@@ -46,7 +53,8 @@ class VoiceCommandService {
   String _lastStatus = '';
 
   final _commandController = StreamController<VoiceCommandEvent>.broadcast();
-  final _transcriptController = StreamController<String>.broadcast();
+  final _transcriptController =
+      StreamController<TranscriptUpdate>.broadcast();
   final _statusController = StreamController<String>.broadcast();
   final _logController = StreamController<VoiceLogLine>.broadcast();
 
@@ -54,7 +62,7 @@ class VoiceCommandService {
   final List<VoiceLogLine> _logBuffer = [];
 
   Stream<VoiceCommandEvent> get commands => _commandController.stream;
-  Stream<String> get transcript => _transcriptController.stream;
+  Stream<TranscriptUpdate> get transcript => _transcriptController.stream;
   Stream<String> get status => _statusController.stream;
   Stream<VoiceLogLine> get logStream => _logController.stream;
   List<VoiceLogLine> get log => List.unmodifiable(_logBuffer);
@@ -305,7 +313,8 @@ class VoiceCommandService {
     if (text.isEmpty) return;
     _log(r.finalResult ? 'info' : 'info',
         'onResult ${r.finalResult ? "final" : "partial"}: "$text"');
-    _transcriptController.add(text);
+    _transcriptController
+        .add(TranscriptUpdate(text, isFinal: r.finalResult));
     if (r.finalResult) {
       if (_sessionTranscript.isEmpty) {
         _sessionTranscript = text;

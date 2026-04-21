@@ -74,6 +74,7 @@ class SettingsService {
   static const String _localeKey = 'speech_locale';
   static const String _pathologistNameKey = 'pathologist_name';
   static const String _pathologistRegKey = 'pathologist_registration';
+  static const String _activeTemplateIdKey = 'active_template_id';
 
   static Box get _box => Hive.box(_boxName);
 
@@ -136,6 +137,15 @@ class SettingsService {
       _box.get(_pathologistRegKey, defaultValue: 'KMC - 79367');
   static Future<void> setPathologistRegistration(String v) =>
       _box.put(_pathologistRegKey, v);
+
+  /// Active report template id. Empty string means "no template" — the
+  /// generator will fall back to its internal structure.
+  static String getActiveTemplateId() =>
+      _box.get(_activeTemplateIdKey, defaultValue: '');
+  static Future<void> setActiveTemplateId(String v) async {
+    await _box.put(_activeTemplateIdKey, v);
+    _notifier.value++;
+  }
 
   // Notifier so widgets watching settings rebuild on change.
   static final ValueNotifier<int> _notifier = ValueNotifier<int>(0);

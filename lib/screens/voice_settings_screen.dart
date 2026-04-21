@@ -27,7 +27,7 @@ enum _EditState { idle, pickingSlot, capturingPhrase, confirming }
 class _VoiceSettingsScreenState extends State<VoiceSettingsScreen> {
   final VoiceCommandService _voice = VoiceCommandService.instance;
   StreamSubscription<VoiceCommandEvent>? _cmdSub;
-  StreamSubscription<String>? _transcriptSub;
+  StreamSubscription<TranscriptUpdate>? _transcriptSub;
 
   _EditState _editState = _EditState.idle;
   VoiceCommand? _selectedCommand;
@@ -39,8 +39,9 @@ class _VoiceSettingsScreenState extends State<VoiceSettingsScreen> {
   void initState() {
     super.initState();
     _cmdSub = _voice.commands.listen(_onCommand);
-    _transcriptSub = _voice.transcript.listen((t) {
+    _transcriptSub = _voice.transcript.listen((u) {
       if (!mounted) return;
+      final t = u.text;
       setState(() {
         _liveTranscript = t;
         if (_editState == _EditState.capturingPhrase) {

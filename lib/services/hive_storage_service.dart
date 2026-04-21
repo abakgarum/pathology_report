@@ -22,6 +22,7 @@ class HiveStorageService {
   static const String patientsBox = 'patients';
   static const String reportsBox = 'reports';
   static const String draftsBox = 'drafts';
+  static const String templatesBox = 'template_files';
 
   static bool _initialized = false;
 
@@ -33,10 +34,12 @@ class HiveStorageService {
     Hive.registerAdapter(VoiceRecordingAdapter());
     Hive.registerAdapter(ReportStatusAdapter());
     Hive.registerAdapter(PathologyReportAdapter());
+    Hive.registerAdapter(TemplateDocumentAdapter());
 
     await Hive.openBox<Patient>(patientsBox);
     await Hive.openBox<PathologyReport>(reportsBox);
     await Hive.openBox(draftsBox); // dynamic map
+    await Hive.openBox<TemplateDocument>(templatesBox);
 
     _initialized = true;
   }
@@ -134,6 +137,52 @@ class HiveStorageService {
   }
 
   static Future<void> clearDraft(String patientId) => _drafts.delete(patientId);
+
+  // ─── Template operations ───────────────────────────────────────
+
+  static Box<TemplateDocument> get _templates =>
+      Hive.box<TemplateDocument>(templatesBox);
+
+  static List<TemplateDocument> allTemplates() {
+    final list = _templates.values.toList();
+    list.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    return list;
+  }
+
+  static TemplateDocument? getTemplate(String id) => _templates.get(id);
+
+  static Future<void> saveTemplate(TemplateDocument t) =>
+      _templates.put(t.id, t);
+
+  static Future<void> deleteTemplate(String id) async {
+    final t = _templates.get(id);
+    if (t != null && t.filePath.isNotEmpty) {
+      try {
+        final f = File(t.filePath);
+        if (await f.exists()) await f.delete();
+      } catch (_) {}
+    }
+    await _templates.delete(id);
+  }
+
+  /// Copy an uploaded template file into the app's documents directory and
+  /// return the stored absolute path. The caller supplies the original file
+  /// path and a stable id; the copy is named `<id><ext>`.
+  static Future<String> storeTemplateFile({
+    required String sourcePath,
+    required String id,
+  }) async {
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory(p.join(docs.path, 'pathology_templates'));
+    if (!await dir.exists()) await dir.create(recursive: true);
+    final ext = p.extension(sourcePath);
+    final dest = p.join(dir.path, '$id$ext');
+    await File(sourcePath).copy(dest);
+    return dest;
+  }
+
+  static ValueListenable<Box<TemplateDocument>> templatesListenable() =>
+      _templates.listenable();
 
   // ─── Audio file storage ────────────────────────────────────────
 

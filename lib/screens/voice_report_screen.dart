@@ -61,8 +61,22 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
   String _candidatePatientId = '';
   String _confirmedPatientId = '';
   String _statusMessage = 'Say your patient ID — or type it below';
-  String _liveTranscript = '';
+
+  // Live recognizer output. `_liveFinal` accumulates finalized chunks; the
+  // still-growing current utterance is kept separately in `_livePartial` so
+  // the display doesn't flicker when a new partial replaces the old one.
+  String _liveFinal = '';
+  String _livePartial = '';
+
   final TextEditingController _patientIdCtrl = TextEditingController();
+
+  String get _liveTranscript {
+    final buf = _liveFinal.trim();
+    final p = _livePartial.trim();
+    if (buf.isEmpty) return p;
+    if (p.isEmpty) return buf;
+    return '$buf $p';
+  }
 
   Duration _recordingDuration = Duration.zero;
   final List<double> _waveform = [];
@@ -73,7 +87,7 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
   PathologyReport? _workingReport;
 
   StreamSubscription<VoiceCommandEvent>? _cmdSub;
-  StreamSubscription<String>? _transcriptSub;
+  StreamSubscription<TranscriptUpdate>? _transcriptSub;
 
   late final AnimationController _pulse;
   late final Animation<double> _pulseAnim;
@@ -113,9 +127,7 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
     }
 
     _cmdSub = _voice.commands.listen(_handleCommand);
-    _transcriptSub = _voice.transcript.listen((t) {
-      if (mounted) setState(() => _liveTranscript = t);
-    });
+    _transcriptSub = _voice.transcript.listen(_handleTranscript);
     _voice.start();
   }
 
@@ -138,6 +150,22 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
       _confirmedPatientId = id;
       _state = _VoiceState.readyToRecord;
       _statusMessage = 'Patient $id ready — dictate or tap record';
+    });
+  }
+
+  // ─── Transcript stream ────────────────────────────────────
+
+  void _handleTranscript(TranscriptUpdate u) {
+    if (!mounted) return;
+    setState(() {
+      if (u.isFinal) {
+        _liveFinal = _liveFinal.isEmpty
+            ? u.text
+            : '${_liveFinal.trim()} ${u.text.trim()}';
+        _livePartial = '';
+      } else {
+        _livePartial = u.text;
+      }
     });
   }
 
@@ -238,6 +266,8 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
       _state = _VoiceState.recording;
       _recordingDuration = Duration.zero;
       _waveform.clear();
+      _liveFinal = '';
+      _livePartial = '';
       _statusMessage = 'Recording — say "pause" or "stop dictation"';
     });
   }
@@ -264,19 +294,30 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
       setState(() => _state = _VoiceState.readyToRecord);
       return;
     }
+    // Seed the recording with the live on-device STT text so a raw transcript
+    // is always available even if Whisper fails or returns nothing.
+    final liveSeed = _liveTranscript.trim();
     final rec = VoiceRecording(
       filePath: path,
       duration: _recordingDuration,
       label: 'Dictation ${_recordings.length + 1}',
+      transcription: liveSeed,
     );
     setState(() {
       _recordings.add(rec);
+      _dictationText = _joinedTranscripts();
       _state = _VoiceState.transcribing;
       _statusMessage = 'Transcribing dictation…';
     });
+    _autosaveDraft();
     await _transcribe(rec);
     await _generateReport();
   }
+
+  String _joinedTranscripts() => _recordings
+      .map((r) => r.transcription.trim())
+      .where((t) => t.isNotEmpty)
+      .join('\n\n');
 
   Future<void> _transcribe(VoiceRecording rec) async {
     try {
@@ -286,25 +327,26 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
             'Medical histopathology dictation. Proper terminology expected.',
       );
       final idx = _recordings.indexWhere((r) => r.id == rec.id);
-      if (idx != -1) {
+      if (idx != -1 && text.trim().isNotEmpty) {
         _recordings[idx] = _recordings[idx].copyWith(transcription: text);
       }
-      setState(() {
-        _dictationText = _recordings
-            .where((r) => r.transcription.isNotEmpty)
-            .map((r) => r.transcription.trim())
-            .join('\n\n');
-      });
+      setState(() => _dictationText = _joinedTranscripts());
       _autosaveDraft();
     } catch (e) {
-      _setStatus('Transcription failed — $e');
+      // Keep the live-STT fallback that was seeded at stop time.
+      _setStatus('Whisper failed — using live transcript · $e');
+      setState(() => _dictationText = _joinedTranscripts());
+      _autosaveDraft();
     }
   }
 
   // ─── Report generation ─────────────────────────────────────
 
   Future<void> _generateReport() async {
-    if (_dictationText.trim().isEmpty) {
+    final rawSource = _dictationText.trim().isNotEmpty
+        ? _dictationText
+        : _liveTranscript;
+    if (rawSource.trim().isEmpty) {
       _setStatus('Nothing to generate from');
       return;
     }
@@ -323,7 +365,7 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
               'known_gender: ${existingPatient.gender}';
 
       final fields = await OpenAIService.generateReportFromTranscript(
-        _dictationText,
+        rawSource,
         patientContext: patientContext,
       );
 
@@ -354,7 +396,7 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
         grossExamination: fields['gross_examination'] ?? '',
         microscopyImpression: fields['microscopy_impression'] ?? '',
         summary: fields['summary'] ?? '',
-        rawTranscript: _dictationText,
+        rawTranscript: rawSource,
         voiceRecordings: List.of(_recordings),
         status: ReportStatus.pending,
         reportedDate: DateTime.now(),
@@ -403,8 +445,11 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
 
   void _autosaveDraft() {
     if (_confirmedPatientId.isEmpty) return;
+    final raw = _dictationText.trim().isNotEmpty
+        ? _dictationText
+        : _liveTranscript;
     HiveStorageService.saveDraft(_confirmedPatientId, {
-      'raw_transcript': _dictationText,
+      'raw_transcript': raw,
       'recording_paths': _recordings.map((r) => r.filePath).toList(),
       'updated_at': DateTime.now().toIso8601String(),
     });
@@ -717,7 +762,10 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 8),
-          if (_liveTranscript.isNotEmpty)
+          if (_state == _VoiceState.recording ||
+              _state == _VoiceState.paused)
+            _liveTranscriptPanel()
+          else if (_liveTranscript.isNotEmpty)
             Text('"${_liveTranscript.toLowerCase()}"',
                 textAlign: TextAlign.center,
                 style: Theme.of(context).textTheme.bodySmall),
@@ -732,6 +780,58 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
             _idChip(_confirmedPatientId, confirmed: true),
           ],
         ],
+      ),
+    );
+  }
+
+  Widget _liveTranscriptPanel() {
+    final finalText = _liveFinal.trim();
+    final partial = _livePartial.trim();
+    final hasAny = finalText.isNotEmpty || partial.isNotEmpty;
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOut,
+      width: double.infinity,
+      constraints: const BoxConstraints(minHeight: 56, maxHeight: 180),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceVariant,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: SingleChildScrollView(
+        reverse: true,
+        child: hasAny
+            ? RichText(
+                textAlign: TextAlign.left,
+                text: TextSpan(
+                  style: const TextStyle(
+                    fontSize: 14,
+                    height: 1.5,
+                    color: AppColors.textPrimary,
+                  ),
+                  children: [
+                    if (finalText.isNotEmpty)
+                      TextSpan(text: finalText),
+                    if (finalText.isNotEmpty && partial.isNotEmpty)
+                      const TextSpan(text: ' '),
+                    if (partial.isNotEmpty)
+                      TextSpan(
+                        text: partial,
+                        style: const TextStyle(
+                          color: AppColors.textSecondary,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                  ],
+                ),
+              )
+            : Text(
+                _state == _VoiceState.paused
+                    ? 'Paused — speech not captured while paused.'
+                    : 'Listening… start speaking.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
       ),
     );
   }

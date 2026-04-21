@@ -9,6 +9,7 @@ import 'package:printing/printing.dart';
 import '../models/report_models.dart';
 import '../services/hive_storage_service.dart';
 import '../theme/app_theme.dart';
+import '../widgets/audio_player_widget.dart';
 import 'report_edit_screen.dart';
 
 /// Report detail view — renders the stored report exactly in the template
@@ -30,6 +31,7 @@ class ReportDetailScreen extends StatefulWidget {
 
 class _ReportDetailScreenState extends State<ReportDetailScreen> {
   late PathologyReport _report;
+  bool _showPlayback = false;
 
   @override
   void initState() {
@@ -43,6 +45,15 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
       appBar: AppBar(
         title: Text(_report.reportNumber),
         actions: [
+          if (_report.voiceRecordings.isNotEmpty)
+            IconButton(
+              onPressed: () =>
+                  setState(() => _showPlayback = !_showPlayback),
+              icon: Icon(_showPlayback
+                  ? Icons.close_rounded
+                  : Icons.play_circle_outline_rounded),
+              tooltip: _showPlayback ? 'Hide playback' : 'Play recording',
+            ),
           IconButton(
             onPressed: _openEdit,
             icon: const Icon(Icons.edit_rounded),
@@ -78,6 +89,11 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
                   onChanged: _changeStatus,
                   onEdit: _openEdit,
                 ),
+                if (_showPlayback &&
+                    _report.voiceRecordings.isNotEmpty) ...[
+                  const SizedBox(height: 16),
+                  _PlaybackPanel(report: _report),
+                ],
                 const SizedBox(height: 16),
                 _TemplateView(r: _report),
               ],
@@ -90,10 +106,28 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
 
   Future<void> _changeStatus(ReportStatus s) async {
     if (_report.status == s) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Change status?'),
+        content: Text(
+            'Set ${_report.reportNumber} from "${_report.status.label}" to "${s.label}"?'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Change'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
     final updated = _report.copyWith(status: s);
     await HiveStorageService.saveReport(updated);
-    setState(() => _report = updated);
     if (!mounted) return;
+    setState(() => _report = updated);
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text('Status set to ${s.label}'),
@@ -229,6 +263,136 @@ class _StatusBar extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+// ─── Playback panel: audio controls + generated script ──────────
+
+class _PlaybackPanel extends StatefulWidget {
+  final PathologyReport report;
+  const _PlaybackPanel({required this.report});
+
+  @override
+  State<_PlaybackPanel> createState() => _PlaybackPanelState();
+}
+
+class _PlaybackPanelState extends State<_PlaybackPanel> {
+  int _selectedClip = 0;
+
+  String _generatedScript() {
+    final r = widget.report;
+    final parts = <String>[
+      if (r.clinicalInformation.trim().isNotEmpty)
+        'CLINICAL INFORMATION\n${r.clinicalInformation.trim()}',
+      if (r.specimen.trim().isNotEmpty)
+        'SPECIMEN\n${r.specimen.trim()}',
+      if (r.grossExamination.trim().isNotEmpty)
+        'GROSS EXAMINATION\n${r.grossExamination.trim()}',
+      if (r.microscopyImpression.trim().isNotEmpty)
+        'MICROSCOPY AND IMPRESSION\n${r.microscopyImpression.trim()}',
+    ];
+    if (parts.isEmpty) return r.rawTranscript.trim();
+    return parts.join('\n\n');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final clips = widget.report.voiceRecordings;
+    if (clips.isEmpty) return const SizedBox.shrink();
+    final clip = clips[_selectedClip.clamp(0, clips.length - 1)];
+    final script = _generatedScript();
+    final isWide = MediaQuery.of(context).size.width > 820;
+
+    final left = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (clips.length > 1)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (var i = 0; i < clips.length; i++)
+                  ChoiceChip(
+                    label: Text(
+                      clips[i].label.isEmpty
+                          ? 'Clip ${i + 1}'
+                          : clips[i].label,
+                      style: const TextStyle(fontSize: 11),
+                    ),
+                    selected: _selectedClip == i,
+                    onSelected: (_) => setState(() => _selectedClip = i),
+                  ),
+              ],
+            ),
+          ),
+        AudioPlayerWidget(
+          key: ValueKey(clip.id),
+          filePath: clip.filePath,
+          title: clip.label.isEmpty
+              ? 'Recording ${_selectedClip + 1}'
+              : clip.label,
+        ),
+      ],
+    );
+
+    final right = Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.description_outlined,
+                  size: 16, color: AppColors.primary),
+              const SizedBox(width: 6),
+              Text('Generated script',
+                  style: Theme.of(context).textTheme.titleMedium),
+            ],
+          ),
+          const SizedBox(height: 10),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 360),
+            child: SingleChildScrollView(
+              child: SelectableText(
+                script.isEmpty ? '— no script generated yet —' : script,
+                style: const TextStyle(
+                  fontSize: 13,
+                  height: 1.5,
+                  color: AppColors.textPrimary,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    return isWide
+        ? IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(child: left),
+                const SizedBox(width: 16),
+                Expanded(child: right),
+              ],
+            ),
+          )
+        : Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              left,
+              const SizedBox(height: 12),
+              right,
+            ],
+          );
   }
 }
 

@@ -34,7 +34,7 @@ class _HomeVoiceScreenState extends State<HomeVoiceScreen>
     with TickerProviderStateMixin {
   final VoiceCommandService _voice = VoiceCommandService.instance;
   StreamSubscription<VoiceCommandEvent>? _cmdSub;
-  StreamSubscription<String>? _transcriptSub;
+  StreamSubscription<TranscriptUpdate>? _transcriptSub;
   String _liveTranscript = '';
   bool _showDebug = false;
 
@@ -52,8 +52,8 @@ class _HomeVoiceScreenState extends State<HomeVoiceScreen>
         .animate(CurvedAnimation(parent: _pulse, curve: Curves.easeInOut));
 
     _cmdSub = _voice.commands.listen(_onCommand);
-    _transcriptSub = _voice.transcript.listen((t) {
-      if (mounted) setState(() => _liveTranscript = t);
+    _transcriptSub = _voice.transcript.listen((u) {
+      if (mounted) setState(() => _liveTranscript = u.text);
     });
     _voice.start();
   }
