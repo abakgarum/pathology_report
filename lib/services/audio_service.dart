@@ -48,10 +48,7 @@ class AudioService {
       final fileName = '${const Uuid().v4()}.m4a';
       _currentFilePath = p.join(recordingsDir, fileName);
 
-      // macOS needs file:/// URL with three slashes for absolute path
-      final fileUrl = Uri.file(_currentFilePath!).toString();
-
-      await _recorder.start(path: fileUrl);
+      await _recorder.start(path: _recorderPathFor(_currentFilePath!));
 
       _state = RecordingState.recording;
       _recordingStartTime = DateTime.now();
@@ -150,8 +147,7 @@ class AudioService {
       final recordingsDir = p.join(dir.path, 'pathology_recordings');
       final fileName = '${const Uuid().v4()}.m4a';
       _currentFilePath = p.join(recordingsDir, fileName);
-      final fileUrl = Uri.file(_currentFilePath!).toString();
-      await _recorder.start(path: fileUrl);
+      await _recorder.start(path: _recorderPathFor(_currentFilePath!));
       // Duration timer keeps running — cumulative duration across chunks.
     } catch (_) {
       _state = RecordingState.idle;
@@ -159,6 +155,12 @@ class AudioService {
     }
 
     return finishedPath;
+  }
+
+  // macOS requires `file:///` URLs; Windows/Linux need native paths.
+  String _recorderPathFor(String nativePath) {
+    if (Platform.isMacOS) return Uri.file(nativePath).toString();
+    return nativePath;
   }
 
   void dispose() {

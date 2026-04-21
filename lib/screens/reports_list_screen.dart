@@ -1,204 +1,149 @@
 import 'package:flutter/material.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+
 import '../models/report_models.dart';
+import '../services/hive_storage_service.dart';
 import '../theme/app_theme.dart';
-import '../utils/demo_data.dart';
 import '../widgets/report_card.dart';
 import 'report_detail_screen.dart';
+import 'voice_report_screen.dart';
 
 class ReportsListScreen extends StatefulWidget {
-  final List<PathologyReport>? reports;
-  final ValueChanged<PathologyReport>? onReportTap;
-
-  const ReportsListScreen({
-    super.key,
-    this.reports,
-    this.onReportTap,
-  });
+  const ReportsListScreen({super.key});
 
   @override
   State<ReportsListScreen> createState() => _ReportsListScreenState();
 }
 
 class _ReportsListScreenState extends State<ReportsListScreen> {
-  ReportStatus? _filterStatus;
-  String _searchQuery = '';
-  final _searchCtrl = TextEditingController();
-
-  @override
-  void dispose() {
-    _searchCtrl.dispose();
-    super.dispose();
-  }
+  String _query = '';
+  ReportStatus? _filter;
 
   @override
   Widget build(BuildContext context) {
-    final allReports = widget.reports ?? DemoData.getSampleReports();
-    final filtered = allReports.where((r) {
-      final matchesStatus = _filterStatus == null || r.status == _filterStatus;
-      final matchesSearch = _searchQuery.isEmpty ||
-          r.patient.name.toLowerCase().contains(_searchQuery.toLowerCase()) ||
-          r.reportNumber.toLowerCase().contains(_searchQuery.toLowerCase()) ||
-          r.findings.diagnosis.toLowerCase().contains(_searchQuery.toLowerCase());
-      return matchesStatus && matchesSearch;
-    }).toList();
-
     return Scaffold(
       backgroundColor: AppColors.background,
+      appBar: AppBar(
+        title: const Text('Reports'),
+        actions: [
+          IconButton(
+            tooltip: 'New voice report',
+            icon: const Icon(Icons.mic_rounded),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const VoiceReportScreen()),
+            ),
+          ),
+        ],
+      ),
       body: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Header
-          Padding(
-            padding: const EdgeInsets.fromLTRB(24, 24, 24, 0),
-            child: Text('All Reports',
-                style: Theme.of(context).textTheme.headlineLarge),
-          ),
-          // Search bar
-          Padding(
-            padding: const EdgeInsets.fromLTRB(24, 16, 24, 0),
-            child: TextField(
-              controller: _searchCtrl,
-              onChanged: (val) => setState(() => _searchQuery = val),
-              decoration: InputDecoration(
-                hintText: 'Search by patient, report #, or diagnosis...',
-                prefixIcon: const Icon(Icons.search_rounded, size: 20),
-                suffixIcon: _searchQuery.isNotEmpty
-                    ? IconButton(
-                        icon: const Icon(Icons.clear, size: 18),
-                        onPressed: () {
-                          _searchCtrl.clear();
-                          setState(() => _searchQuery = '');
-                        },
-                      )
-                    : null,
-              ),
-            ),
-          ),
-          // Filter chips
-          Padding(
-            padding: const EdgeInsets.fromLTRB(24, 14, 24, 6),
-            child: Row(
-              children: [
-                _FilterChip(
-                  label: 'All',
-                  isSelected: _filterStatus == null,
-                  onTap: () => setState(() => _filterStatus = null),
-                ),
-                const SizedBox(width: 8),
-                _FilterChip(
-                  label: 'Completed',
-                  isSelected: _filterStatus == ReportStatus.completed,
-                  color: AppColors.completed,
-                  onTap: () => setState(() => _filterStatus = ReportStatus.completed),
-                ),
-                const SizedBox(width: 8),
-                _FilterChip(
-                  label: 'Pending',
-                  isSelected: _filterStatus == ReportStatus.pending,
-                  color: AppColors.pending,
-                  onTap: () => setState(() => _filterStatus = ReportStatus.pending),
-                ),
-                const SizedBox(width: 8),
-                _FilterChip(
-                  label: 'Draft',
-                  isSelected: _filterStatus == ReportStatus.draft,
-                  color: AppColors.draft,
-                  onTap: () => setState(() => _filterStatus = ReportStatus.draft),
-                ),
-                const Spacer(),
-                Text(
-                  '${filtered.length} report${filtered.length != 1 ? 's' : ''}',
-                  style: Theme.of(context).textTheme.bodyMedium,
-                ),
-              ],
-            ),
-          ),
-          // Report list
+          _filterBar(),
           Expanded(
-            child: filtered.isEmpty
-                ? Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.search_off_rounded,
-                            size: 48, color: AppColors.textHint),
-                        const SizedBox(height: 12),
-                        Text('No reports found',
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyLarge
-                                ?.copyWith(color: AppColors.textHint)),
-                      ],
-                    ),
-                  )
-                : ListView.builder(
-                    padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
-                    itemCount: filtered.length,
-                    itemBuilder: (context, index) {
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 12),
-                        child: ReportCard(
-                          report: filtered[index],
-                          onTap: () {
-                            if (widget.onReportTap != null) {
-                              widget.onReportTap!(filtered[index]);
-                            } else {
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                  builder: (_) => ReportDetailScreen(
-                                      report: filtered[index]),
-                                ),
-                              );
-                            }
-                          },
+            child: ValueListenableBuilder(
+              valueListenable: HiveStorageService.reportsListenable(),
+              builder: (context, Box<PathologyReport> box, _) {
+                final reports =
+                    HiveStorageService.allReports().where(_matches).toList();
+                if (reports.isEmpty) return _empty();
+                return ListView.separated(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: reports.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 10),
+                  itemBuilder: (_, i) => ReportCard(
+                    report: reports[i],
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => ReportDetailScreen(
+                          report: reports[i],
+                          onDeleted: () => setState(() {}),
                         ),
-                      );
-                    },
+                      ),
+                    ),
                   ),
+                );
+              },
+            ),
           ),
         ],
       ),
     );
   }
-}
 
-class _FilterChip extends StatelessWidget {
-  final String label;
-  final bool isSelected;
-  final Color? color;
-  final VoidCallback onTap;
+  bool _matches(PathologyReport r) {
+    if (_filter != null && r.status != _filter) return false;
+    if (_query.trim().isEmpty) return true;
+    final q = _query.toLowerCase();
+    return r.reportNumber.toLowerCase().contains(q) ||
+        r.patientId.toLowerCase().contains(q) ||
+        r.patientName.toLowerCase().contains(q) ||
+        r.microscopyImpression.toLowerCase().contains(q);
+  }
 
-  const _FilterChip({
-    required this.label,
-    required this.isSelected,
-    this.color,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final chipColor = color ?? AppColors.primary;
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(20),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-        decoration: BoxDecoration(
-          color: isSelected ? chipColor.withOpacity(0.12) : Colors.transparent,
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-            color: isSelected ? chipColor : AppColors.border,
+  Widget _filterBar() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      color: AppColors.surface,
+      child: Column(
+        children: [
+          TextField(
+            onChanged: (v) => setState(() => _query = v),
+            decoration: const InputDecoration(
+              hintText: 'Search by report #, patient ID, name, or impression',
+              prefixIcon: Icon(Icons.search_rounded, size: 20),
+              isDense: true,
+            ),
           ),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: isSelected ? chipColor : AppColors.textSecondary,
-            fontWeight: isSelected ? FontWeight.w600 : FontWeight.w400,
-            fontSize: 13,
+          const SizedBox(height: 10),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                _filterChip('All', null),
+                _filterChip('Draft', ReportStatus.draft),
+                _filterChip('Pending', ReportStatus.pending),
+                _filterChip('Completed', ReportStatus.completed),
+              ],
+            ),
           ),
-        ),
+        ],
+      ),
+    );
+  }
+
+  Widget _filterChip(String label, ReportStatus? status) {
+    final selected = _filter == status;
+    return Padding(
+      padding: const EdgeInsets.only(right: 8),
+      child: ChoiceChip(
+        label: Text(label),
+        selected: selected,
+        onSelected: (_) => setState(() => _filter = status),
+      ),
+    );
+  }
+
+  Widget _empty() {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.inbox_outlined,
+              size: 56, color: AppColors.textHint.withOpacity(0.5)),
+          const SizedBox(height: 12),
+          Text('No reports yet',
+              style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 4),
+          Text('Tap the mic to create your first voice report',
+              style: Theme.of(context).textTheme.bodySmall),
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const VoiceReportScreen()),
+            ),
+            icon: const Icon(Icons.mic_rounded),
+            label: const Text('New Voice Report'),
+          ),
+        ],
       ),
     );
   }

@@ -38,6 +38,13 @@ class ReportCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final statusColor = _statusColor(report.status);
+    final displayName =
+        report.patientName.isEmpty ? report.patientId : report.patientName;
+    final ageGender = [
+      if (report.patientAge > 0) '${report.patientAge}y',
+      if (report.patientGender.isNotEmpty) report.patientGender,
+    ].join(', ');
+
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(16),
@@ -59,31 +66,25 @@ class ReportCard extends StatelessWidget {
                     color: AppColors.primary.withOpacity(0.08),
                     borderRadius: BorderRadius.circular(10),
                   ),
-                  child: const Icon(
-                    Icons.biotech_rounded,
-                    color: AppColors.primary,
-                    size: 20,
-                  ),
+                  child: const Icon(Icons.biotech_rounded,
+                      color: AppColors.primary, size: 20),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        report.reportNumber,
-                        style: Theme.of(context).textTheme.titleLarge,
-                      ),
+                      Text(report.reportNumber,
+                          style: Theme.of(context).textTheme.titleLarge),
                       const SizedBox(height: 2),
-                      Text(
-                        report.patient.name,
-                        style: Theme.of(context).textTheme.bodyMedium,
-                      ),
+                      Text(displayName,
+                          style: Theme.of(context).textTheme.bodyMedium),
                     ],
                   ),
                 ),
                 Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 6),
                   decoration: BoxDecoration(
                     color: statusColor.withOpacity(0.1),
                     borderRadius: BorderRadius.circular(20),
@@ -91,7 +92,8 @@ class ReportCard extends StatelessWidget {
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(_statusIcon(report.status), size: 14, color: statusColor),
+                      Icon(_statusIcon(report.status),
+                          size: 14, color: statusColor),
                       const SizedBox(width: 4),
                       Text(
                         report.status.label,
@@ -112,14 +114,13 @@ class ReportCard extends StatelessWidget {
             Row(
               children: [
                 _InfoChip(
-                  icon: Icons.person_outline_rounded,
-                  label: '${report.patient.age}y, ${report.patient.gender}',
+                  icon: Icons.badge_outlined,
+                  label: report.patientId.isEmpty ? '—' : report.patientId,
                 ),
-                const SizedBox(width: 12),
-                _InfoChip(
-                  icon: Icons.science_outlined,
-                  label: report.specimen.type.label,
-                ),
+                if (ageGender.isNotEmpty) ...[
+                  const SizedBox(width: 12),
+                  _InfoChip(icon: Icons.person_outline_rounded, label: ageGender),
+                ],
                 const Spacer(),
                 Text(
                   DateFormat('dd MMM yyyy').format(report.createdAt),
@@ -127,8 +128,7 @@ class ReportCard extends StatelessWidget {
                 ),
               ],
             ),
-            if (report.findings.diagnosis.isNotEmpty &&
-                report.findings.diagnosis != 'Pending') ...[
+            if (report.microscopyImpression.isNotEmpty) ...[
               const SizedBox(height: 10),
               Container(
                 width: double.infinity,
@@ -138,7 +138,7 @@ class ReportCard extends StatelessWidget {
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: Text(
-                  report.findings.diagnosis,
+                  report.microscopyImpression,
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         fontWeight: FontWeight.w500,
                         color: AppColors.textPrimary,

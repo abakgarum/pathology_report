@@ -29,6 +29,8 @@
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>This app requires microphone access.</string>
+	<string>This app requires microphone access for voice dictation and voice commands.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>This app uses speech recognition to detect voice commands and transcribe dictations.</string>
 </dict>
 </plist>

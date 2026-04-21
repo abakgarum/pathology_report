@@ -1,20 +1,51 @@
 import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+
 import '../models/report_models.dart';
 import '../services/audio_service.dart';
-import '../services/gemini_service.dart';
-import '../services/stt_service.dart';
+import '../services/hive_storage_service.dart';
+import '../services/openai_service.dart';
+import '../services/settings_service.dart';
+import '../services/voice_command_service.dart';
 import '../theme/app_theme.dart';
-import '../widgets/audio_player_widget.dart';
+import '../widgets/voice_debug_panel.dart';
+
+/// Fully voice-driven report creation.
+///
+/// State machine:
+///   awaitingPatientId  → user says "patient id is <X>"            → confirmingPatientId
+///   confirmingPatientId → "confirm" / "cancel"
+///   readyToRecord      → "start dictation"                        → recording
+///   recording           → "pause" → paused ; "stop dictation"     → transcribing
+///   paused              → "resume"                                 → recording
+///   transcribing        → (auto)                                   → generating
+///   generating          → (auto)                                   → reportReady
+///   reportReady         → "save report" / "discard"
+enum _VoiceState {
+  awaitingPatientId,
+  confirmingPatientId,
+  readyToRecord,
+  recording,
+  paused,
+  transcribing,
+  generating,
+  reportReady,
+  saved,
+}
 
 class VoiceReportScreen extends StatefulWidget {
   final PathologyReport? existingReport;
   final ValueChanged<PathologyReport>? onReportSaved;
+  final VoidCallback? onBack;
 
   const VoiceReportScreen({
     super.key,
     this.existingReport,
     this.onReportSaved,
+    this.onBack,
   });
 
   @override
@@ -23,1987 +54,1105 @@ class VoiceReportScreen extends StatefulWidget {
 
 class _VoiceReportScreenState extends State<VoiceReportScreen>
     with TickerProviderStateMixin {
-  final AudioService _audioService = AudioService();
-  final ScrollController _transcriptScrollCtrl = ScrollController();
+  final AudioService _audio = AudioService();
+  final VoiceCommandService _voice = VoiceCommandService.instance;
 
-  // State
-  bool _isRecording = false;
-  bool _isPaused = false;
-  bool _isGenerating = false;
-  bool _showRawTranscript = false;
+  _VoiceState _state = _VoiceState.awaitingPatientId;
+  String _candidatePatientId = '';
+  String _confirmedPatientId = '';
+  String _statusMessage = 'Say your patient ID — or type it below';
+  String _liveTranscript = '';
+  final TextEditingController _patientIdCtrl = TextEditingController();
+
   Duration _recordingDuration = Duration.zero;
-  final List<double> _waveformData = [];
-
-  // Data
+  final List<double> _waveform = [];
   final List<VoiceRecording> _recordings = [];
-  final Set<String> _transcribingIds = {};
-  String _fullTranscript = '';
-  Map<String, String>? _generatedReport;
-  String _generatedSummary = '';
-  bool _reportGenerated = false;
+  String _dictationText = '';
+  bool _showDebugLog = false;
 
-  // Patient quick-fill
-  final _patientNameCtrl = TextEditingController();
-  final _patientAgeCtrl = TextEditingController();
-  String _selectedGender = 'Male';
+  PathologyReport? _workingReport;
 
-  // Speech-to-text provider selection
-  SttProvider _sttProvider = SttProvider.whisper;
+  StreamSubscription<VoiceCommandEvent>? _cmdSub;
+  StreamSubscription<String>? _transcriptSub;
 
-  // Streaming (live translation)
-  bool _streamEnabled = false;
-  static const Duration _chunkInterval = Duration(seconds: 5);
-  Timer? _chunkTimer;
-  final List<_LiveChunk> _liveChunks = [];
-  int _liveChunksInFlight = 0;
-
-  // Animation
-  late AnimationController _pulseController;
-  late Animation<double> _pulseAnimation;
+  late final AnimationController _pulse;
+  late final Animation<double> _pulseAnim;
 
   @override
   void initState() {
     super.initState();
-    _pulseController = AnimationController(
+    _pulse = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1200),
+      duration: const Duration(milliseconds: 1100),
     )..repeat(reverse: true);
-    _pulseAnimation = Tween<double>(begin: 1.0, end: 1.3).animate(
-      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
-    );
+    _pulseAnim = Tween<double>(begin: 1, end: 1.18)
+        .animate(CurvedAnimation(parent: _pulse, curve: Curves.easeInOut));
 
-    _audioService.durationStream.listen((d) {
+    _audio.durationStream.listen((d) {
       if (mounted) setState(() => _recordingDuration = d);
     });
-
-    _audioService.amplitudeStream.listen((a) {
+    _audio.amplitudeStream.listen((a) {
       if (mounted) {
         setState(() {
-          if (_waveformData.length > 100) _waveformData.removeAt(0);
-          _waveformData.add(a);
+          if (_waveform.length > 100) _waveform.removeAt(0);
+          _waveform.add(a);
         });
       }
     });
+
+    if (widget.existingReport != null) {
+      final r = widget.existingReport!;
+      _confirmedPatientId = r.patientId;
+      _candidatePatientId = r.patientId;
+      _patientIdCtrl.text = r.patientId;
+      _workingReport = r;
+      _recordings.addAll(r.voiceRecordings);
+      _dictationText = r.rawTranscript;
+      _state = _VoiceState.readyToRecord;
+      _statusMessage = 'Say "start dictation" to add to this report';
+    }
+
+    _cmdSub = _voice.commands.listen(_handleCommand);
+    _transcriptSub = _voice.transcript.listen((t) {
+      if (mounted) setState(() => _liveTranscript = t);
+    });
+    _voice.start();
   }
 
   @override
   void dispose() {
-    _chunkTimer?.cancel();
-    _pulseController.dispose();
-    _audioService.dispose();
-    _transcriptScrollCtrl.dispose();
-    _patientNameCtrl.dispose();
-    _patientAgeCtrl.dispose();
+    _cmdSub?.cancel();
+    _transcriptSub?.cancel();
+    _pulse.dispose();
+    _audio.dispose();
+    _patientIdCtrl.dispose();
     super.dispose();
   }
 
+  // Manual (tap) patient ID entry. Mirrors what _confirmPatientId does for voice.
+  void _setPatientIdManually(String value) {
+    final id = value.trim().toUpperCase();
+    if (id.isEmpty) return;
+    setState(() {
+      _candidatePatientId = id;
+      _confirmedPatientId = id;
+      _state = _VoiceState.readyToRecord;
+      _statusMessage = 'Patient $id ready — dictate or tap record';
+    });
+  }
+
+  // ─── Command dispatch ─────────────────────────────────────
+
+  Future<void> _handleCommand(VoiceCommandEvent e) async {
+    if (!mounted) return;
+    debugPrint('voice command: ${e.command} payload=${e.payload}');
+
+    // Global: back/home works from any state.
+    if (e.command == VoiceCommand.back ||
+        e.command == VoiceCommand.dashboard) {
+      widget.onBack?.call();
+      return;
+    }
+
+    switch (_state) {
+      case _VoiceState.awaitingPatientId:
+        if (e.command == VoiceCommand.patientId && e.payload.isNotEmpty) {
+          setState(() {
+            _candidatePatientId = e.payload;
+            _state = _VoiceState.confirmingPatientId;
+            _statusMessage =
+                'Patient ID: $_candidatePatientId — say "confirm" or "cancel"';
+          });
+        }
+        break;
+
+      case _VoiceState.confirmingPatientId:
+        if (e.command == VoiceCommand.confirm) {
+          _confirmPatientId();
+        } else if (e.command == VoiceCommand.cancel ||
+            e.command == VoiceCommand.discard) {
+          setState(() {
+            _candidatePatientId = '';
+            _state = _VoiceState.awaitingPatientId;
+            _statusMessage = 'Say your patient ID';
+          });
+        } else if (e.command == VoiceCommand.patientId &&
+            e.payload.isNotEmpty) {
+          setState(() {
+            _candidatePatientId = e.payload;
+            _statusMessage =
+                'Patient ID: $_candidatePatientId — say "confirm" or "cancel"';
+          });
+        }
+        break;
+
+      case _VoiceState.readyToRecord:
+        if (e.command == VoiceCommand.start) await _startRecording();
+        break;
+
+      case _VoiceState.recording:
+        if (e.command == VoiceCommand.pause) await _pauseRecording();
+        if (e.command == VoiceCommand.stop) await _stopRecording();
+        break;
+
+      case _VoiceState.paused:
+        if (e.command == VoiceCommand.resume) await _resumeRecording();
+        if (e.command == VoiceCommand.stop) await _stopRecording();
+        break;
+
+      case _VoiceState.reportReady:
+        if (e.command == VoiceCommand.save) await _saveReport();
+        if (e.command == VoiceCommand.discard) _reset();
+        if (e.command == VoiceCommand.generate) await _generateReport();
+        break;
+
+      case _VoiceState.transcribing:
+      case _VoiceState.generating:
+      case _VoiceState.saved:
+        break;
+    }
+  }
+
+  void _confirmPatientId() {
+    setState(() {
+      _confirmedPatientId = _candidatePatientId;
+      _state = _VoiceState.readyToRecord;
+      _statusMessage =
+          'Patient $_confirmedPatientId ready — say "start dictation"';
+    });
+  }
+
+  // ─── Recording ───────────────────────────────────────────
+
+  Future<void> _startRecording() async {
+    if (!await _audio.hasPermission()) {
+      _setStatus('Microphone permission denied');
+      return;
+    }
+    final path = await _audio.startRecording();
+    if (path == null) {
+      _setStatus('Could not start recording');
+      return;
+    }
+    setState(() {
+      _state = _VoiceState.recording;
+      _recordingDuration = Duration.zero;
+      _waveform.clear();
+      _statusMessage = 'Recording — say "pause" or "stop dictation"';
+    });
+  }
+
+  Future<void> _pauseRecording() async {
+    await _audio.pauseRecording();
+    setState(() {
+      _state = _VoiceState.paused;
+      _statusMessage = 'Paused — say "resume" or "stop dictation"';
+    });
+  }
+
+  Future<void> _resumeRecording() async {
+    await _audio.resumeRecording();
+    setState(() {
+      _state = _VoiceState.recording;
+      _statusMessage = 'Recording — say "pause" or "stop dictation"';
+    });
+  }
+
+  Future<void> _stopRecording() async {
+    final path = await _audio.stopRecording();
+    if (path == null) {
+      setState(() => _state = _VoiceState.readyToRecord);
+      return;
+    }
+    final rec = VoiceRecording(
+      filePath: path,
+      duration: _recordingDuration,
+      label: 'Dictation ${_recordings.length + 1}',
+    );
+    setState(() {
+      _recordings.add(rec);
+      _state = _VoiceState.transcribing;
+      _statusMessage = 'Transcribing dictation…';
+    });
+    await _transcribe(rec);
+    await _generateReport();
+  }
+
+  Future<void> _transcribe(VoiceRecording rec) async {
+    try {
+      final text = await OpenAIService.transcribeAudio(
+        rec.filePath,
+        prompt:
+            'Medical histopathology dictation. Proper terminology expected.',
+      );
+      final idx = _recordings.indexWhere((r) => r.id == rec.id);
+      if (idx != -1) {
+        _recordings[idx] = _recordings[idx].copyWith(transcription: text);
+      }
+      setState(() {
+        _dictationText = _recordings
+            .where((r) => r.transcription.isNotEmpty)
+            .map((r) => r.transcription.trim())
+            .join('\n\n');
+      });
+      _autosaveDraft();
+    } catch (e) {
+      _setStatus('Transcription failed — $e');
+    }
+  }
+
+  // ─── Report generation ─────────────────────────────────────
+
+  Future<void> _generateReport() async {
+    if (_dictationText.trim().isEmpty) {
+      _setStatus('Nothing to generate from');
+      return;
+    }
+    setState(() {
+      _state = _VoiceState.generating;
+      _statusMessage = 'Generating report…';
+    });
+    try {
+      final existingPatient =
+          HiveStorageService.getPatient(_confirmedPatientId);
+      final patientContext = existingPatient == null
+          ? 'patient_id: $_confirmedPatientId'
+          : 'patient_id: $_confirmedPatientId\n'
+              'known_name: ${existingPatient.name}\n'
+              'known_age: ${existingPatient.age}\n'
+              'known_gender: ${existingPatient.gender}';
+
+      final fields = await OpenAIService.generateReportFromTranscript(
+        _dictationText,
+        patientContext: patientContext,
+      );
+
+      final reportNumber = widget.existingReport?.reportNumber ??
+          HiveStorageService.nextReportNumber();
+
+      final report = (widget.existingReport ??
+              PathologyReport(
+                reportNumber: reportNumber,
+                patientId: _confirmedPatientId,
+              ))
+          .copyWith(
+        patientId: _confirmedPatientId,
+        patientName: _nonEmpty(fields['patient_name'], existingPatient?.name),
+        patientAge: int.tryParse(fields['patient_age'] ?? '') ??
+            existingPatient?.age ??
+            0,
+        patientGender:
+            _nonEmpty(fields['patient_gender'], existingPatient?.gender),
+        mrn: _nonEmpty(fields['patient_id'], _confirmedPatientId),
+        labNo: _nonEmpty(fields['lab_no'], existingPatient?.labNumber),
+        visitNo: _nonEmpty(fields['visit_no'], existingPatient?.visitNumber),
+        orderedBy: _nonEmpty(fields['ordered_by'], existingPatient?.orderedBy),
+        referredBy: _nonEmpty(
+            fields['referred_by'], existingPatient?.referringDoctor),
+        clinicalInformation: fields['clinical_information'] ?? '',
+        specimen: fields['specimen'] ?? '',
+        grossExamination: fields['gross_examination'] ?? '',
+        microscopyImpression: fields['microscopy_impression'] ?? '',
+        summary: fields['summary'] ?? '',
+        rawTranscript: _dictationText,
+        voiceRecordings: List.of(_recordings),
+        status: ReportStatus.pending,
+        reportedDate: DateTime.now(),
+        pathologistName: SettingsService.getPathologistName(),
+        pathologistRegistration: SettingsService.getPathologistRegistration(),
+      );
+
+      setState(() {
+        _workingReport = report;
+        _state = _VoiceState.reportReady;
+        _statusMessage = 'Report ready — say "save report" or "discard"';
+      });
+    } catch (e) {
+      _setStatus('Generation failed — $e');
+      setState(() => _state = _VoiceState.readyToRecord);
+    }
+  }
+
+  String _nonEmpty(String? a, String? b) {
+    if (a != null && a.trim().isNotEmpty) return a.trim();
+    return b ?? '';
+  }
+
+  Future<void> _saveReport() async {
+    final r = _workingReport;
+    if (r == null) return;
+    await HiveStorageService.saveReport(r);
+    await HiveStorageService.clearDraft(r.patientId);
+    widget.onReportSaved?.call(r);
+    setState(() {
+      _state = _VoiceState.saved;
+      _statusMessage =
+          'Saved ${r.reportNumber}. Say "new report" or "go back".';
+    });
+  }
+
+  void _reset() {
+    setState(() {
+      _workingReport = null;
+      _dictationText = '';
+      _recordings.clear();
+      _state = _VoiceState.readyToRecord;
+      _statusMessage = 'Discarded. Say "start dictation" to retry.';
+    });
+  }
+
+  void _autosaveDraft() {
+    if (_confirmedPatientId.isEmpty) return;
+    HiveStorageService.saveDraft(_confirmedPatientId, {
+      'raw_transcript': _dictationText,
+      'recording_paths': _recordings.map((r) => r.filePath).toList(),
+      'updated_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  void _setStatus(String msg) {
+    if (!mounted) return;
+    setState(() => _statusMessage = msg);
+  }
+
+  // ─── UI (display-only; no input controls) ─────────────────
+
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isWide = screenWidth > 900;
-
+    final isWide = MediaQuery.of(context).size.width > 900;
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Column(
         children: [
-          // Top bar
-          _buildTopBar(context),
-          // Main content
+          _topBar(),
           Expanded(
             child: isWide
                 ? Row(
                     children: [
-                      // Left: Recording + Transcript
-                      Expanded(flex: 5, child: _buildRecordingPanel()),
+                      Expanded(flex: 5, child: _leftPanel()),
                       const VerticalDivider(width: 1),
-                      // Right: Generated Report
-                      Expanded(flex: 5, child: _buildReportPanel()),
+                      Expanded(flex: 5, child: _rightPanel()),
                     ],
                   )
                 : SingleChildScrollView(
                     child: Column(
                       children: [
-                        _buildRecordingPanel(),
+                        _leftPanel(),
                         const Divider(height: 1),
-                        _buildReportPanel(),
+                        _rightPanel(),
                       ],
                     ),
                   ),
           ),
+          _commandHints(),
+          if (_showDebugLog)
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 0, 16, 12),
+              child: VoiceDebugPanel(height: 200),
+            ),
         ],
       ),
     );
   }
 
-  Widget _buildTopBar(BuildContext context) {
+  Widget _topBar() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
       decoration: const BoxDecoration(
         color: AppColors.surface,
         border: Border(bottom: BorderSide(color: AppColors.border)),
       ),
-      child: Row(
-        children: [
-          IconButton(
-            onPressed: () => Navigator.maybePop(context),
-            icon: const Icon(Icons.arrow_back_rounded),
-            tooltip: 'Back',
-          ),
-          const SizedBox(width: 8),
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              gradient: const LinearGradient(
-                colors: [AppColors.primary, AppColors.primaryLight],
-              ),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: const Icon(Icons.mic_rounded, color: Colors.white, size: 20),
-          ),
-          const SizedBox(width: 12),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text('Voice Report',
-                  style: Theme.of(context).textTheme.titleLarge),
-              Text('Dictate and auto-generate pathology reports',
-                  style: Theme.of(context).textTheme.bodySmall),
-            ],
-          ),
-          const Spacer(),
-          _buildStreamToggle(),
-          const SizedBox(width: 10),
-          _buildSttProviderSelector(),
-          const SizedBox(width: 12),
-          if (_reportGenerated)
-            ElevatedButton.icon(
-              onPressed: _saveReport,
-              icon: const Icon(Icons.save_rounded, size: 18),
-              label: const Text('Save Report'),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.success,
-              ),
-            ),
-          const SizedBox(width: 8),
-          OutlinedButton.icon(
-            onPressed: _fullTranscript.isNotEmpty ? _generateFullReport : null,
-            icon: _isGenerating
-                ? const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.auto_awesome, size: 18),
-            label: Text(_isGenerating ? 'Generating...' : 'Generate Report'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ─── LEFT PANEL: Recording + Live Transcript ───────────────────
-
-  Widget _buildRecordingPanel() {
-    return Container(
-      color: AppColors.background,
       child: Column(
-        children: [
-          // Patient quick info bar
-          _buildPatientQuickBar(),
-          // Recording controls
-          Expanded(child: _buildRecordingArea()),
-          // Transcript area
-          Expanded(flex: 2, child: _buildTranscriptArea()),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildPatientQuickBar() {
-    return Container(
-      margin: const EdgeInsets.all(16),
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: AppColors.border),
-      ),
-      child: Row(
-        children: [
-          const Icon(Icons.person_outline, color: AppColors.primary, size: 20),
-          const SizedBox(width: 10),
-          Expanded(
-            flex: 3,
-            child: TextField(
-              controller: _patientNameCtrl,
-              decoration: const InputDecoration(
-                hintText: 'Patient Name',
-                isDense: true,
-                contentPadding:
-                    EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              ),
-              style: const TextStyle(fontSize: 14),
-            ),
-          ),
-          const SizedBox(width: 10),
-          SizedBox(
-            width: 70,
-            child: TextField(
-              controller: _patientAgeCtrl,
-              decoration: const InputDecoration(
-                hintText: 'Age',
-                isDense: true,
-                contentPadding:
-                    EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              ),
-              keyboardType: TextInputType.number,
-              style: const TextStyle(fontSize: 14),
-            ),
-          ),
-          const SizedBox(width: 10),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'Male', label: Text('M')),
-              ButtonSegment(value: 'Female', label: Text('F')),
-            ],
-            selected: {_selectedGender},
-            onSelectionChanged: (v) =>
-                setState(() => _selectedGender = v.first),
-            style: ButtonStyle(
-              visualDensity: VisualDensity.compact,
-              textStyle:
-                  WidgetStatePropertyAll(Theme.of(context).textTheme.bodySmall),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildRecordingArea() {
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 16),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: _isRecording
-              ? AppColors.error.withOpacity(0.5)
-              : AppColors.border,
-          width: _isRecording ? 2 : 1,
-        ),
-      ),
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-          // Waveform or idle state
-          if (_isRecording || _isPaused) ...[
-            // Live waveform
-            SizedBox(
-              height: 60,
-              child: CustomPaint(
-                size: const Size(double.infinity, 60),
-                painter: _WaveformPainter(
-                  data: _waveformData,
-                  color: _isPaused ? AppColors.warning : AppColors.error,
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            // Duration
-            Text(
-              _formatDuration(_recordingDuration),
-              style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                    fontFamily: 'monospace',
-                    color: _isPaused ? AppColors.warning : AppColors.error,
-                    fontWeight: FontWeight.w700,
-                  ),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              _isPaused ? 'PAUSED' : 'RECORDING',
-              style: TextStyle(
-                color: _isPaused ? AppColors.warning : AppColors.error,
-                fontSize: 11,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 2,
-              ),
-            ),
-          ] else ...[
-            Icon(
-              Icons.mic_none_rounded,
-              size: 40,
-              color: AppColors.textHint.withOpacity(0.5),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'Tap the mic to start dictating',
-              style: Theme.of(context).textTheme.bodyMedium,
-            ),
-            if (_recordings.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 4),
-                child: Text(
-                  '${_recordings.length} recording(s) captured',
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: AppColors.success,
-                      ),
-                ),
-              ),
-          ],
-          const SizedBox(height: 16),
-          // Controls
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              if (_isRecording || _isPaused) ...[
-                // Pause/Resume
-                _ControlButton(
-                  icon: _isPaused
-                      ? Icons.play_arrow_rounded
-                      : Icons.pause_rounded,
-                  label: _isPaused ? 'Resume' : 'Pause',
-                  color: AppColors.warning,
-                  onTap: _isPaused ? _resumeRecording : _pauseRecording,
-                ),
-                const SizedBox(width: 20),
-                // Stop
-                AnimatedBuilder(
-                  animation: _pulseAnimation,
-                  builder: (context, child) {
-                    return Transform.scale(
-                      scale: _isRecording ? _pulseAnimation.value : 1.0,
-                      child: child,
-                    );
-                  },
-                  child: _ControlButton(
-                    icon: Icons.stop_rounded,
-                    label: 'Stop & Save',
-                    color: AppColors.error,
-                    onTap: _stopRecording,
-                    large: true,
-                  ),
-                ),
-                const SizedBox(width: 20),
-                // Discard
-                _ControlButton(
-                  icon: Icons.delete_outline_rounded,
-                  label: 'Discard',
-                  color: AppColors.textHint,
-                  onTap: _discardRecording,
-                ),
-              ] else ...[
-                // Start recording
-                _ControlButton(
-                  icon: Icons.mic_rounded,
-                  label: 'Start Recording',
-                  color: AppColors.primary,
-                  onTap: _startRecording,
-                  large: true,
-                ),
-              ],
-            ],
-          ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildTranscriptArea() {
-    final streaming = _streamEnabled && (_isRecording || _liveChunks.isNotEmpty);
-    final liveDoneCount = _liveChunks
-        .where((c) => c.status == _LiveChunkStatus.done)
-        .length;
-
-    return Container(
-      margin: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: streaming
-              ? AppColors.error.withOpacity(0.35)
-              : AppColors.border,
-          width: streaming ? 1.5 : 1,
-        ),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Header
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            decoration: BoxDecoration(
-              border: const Border(
-                  bottom: BorderSide(color: AppColors.border)),
-              gradient: streaming
-                  ? LinearGradient(
-                      colors: [
-                        AppColors.error.withOpacity(0.05),
-                        AppColors.primary.withOpacity(0.02),
-                      ],
-                    )
-                  : null,
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  streaming
-                      ? Icons.graphic_eq_rounded
-                      : Icons.text_snippet_outlined,
-                  size: 18,
-                  color: streaming ? AppColors.error : AppColors.primary,
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  streaming ? 'Live Translation' : 'Live Transcript',
-                  style: Theme.of(context).textTheme.titleMedium,
-                ),
-                if (streaming) ...[
-                  const SizedBox(width: 10),
-                  _LivePulseDot(animation: _pulseAnimation),
-                  const SizedBox(width: 4),
-                  Text('LIVE',
-                      style: TextStyle(
-                        color: AppColors.error,
-                        fontSize: 10,
-                        fontWeight: FontWeight.w800,
-                        letterSpacing: 1.4,
-                      )),
-                ],
-                const Spacer(),
-                if (streaming) ...[
-                  _MiniChip(
-                    icon: Icons.bolt_rounded,
-                    label: '$liveDoneCount',
-                    tooltip: 'Chunks transcribed',
-                    color: AppColors.success,
-                  ),
-                  const SizedBox(width: 6),
-                  if (_liveChunksInFlight > 0)
-                    _MiniChip(
-                      icon: Icons.sync_rounded,
-                      label: '$_liveChunksInFlight',
-                      tooltip: 'Chunks in flight',
-                      color: AppColors.primary,
-                      spinning: true,
-                    ),
-                ],
-                if (!streaming && _fullTranscript.isNotEmpty) ...[
-                  TextButton.icon(
-                    onPressed: () => setState(
-                        () => _showRawTranscript = !_showRawTranscript),
-                    icon: Icon(
-                      _showRawTranscript
-                          ? Icons.visibility_off_outlined
-                          : Icons.visibility_outlined,
-                      size: 16,
-                    ),
-                    label: Text(_showRawTranscript ? 'Hide Raw' : 'Show Raw'),
-                    style: TextButton.styleFrom(
-                      foregroundColor: AppColors.textSecondary,
-                      textStyle: const TextStyle(fontSize: 12),
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.copy_rounded, size: 18),
-                    tooltip: 'Copy transcript',
-                    onPressed: () {},
-                  ),
-                ],
-              ],
-            ),
-          ),
-          // Body
-          Expanded(
-            child: (_fullTranscript.isEmpty &&
-                    !_isRecording &&
-                    _liveChunks.isEmpty)
-                ? _buildTranscriptEmptyState()
-                : SingleChildScrollView(
-                    controller: _transcriptScrollCtrl,
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        // Live stream panel (top, sticky feel)
-                        if (streaming) _buildLiveStreamPanel(),
-                        if (streaming && _recordings.isNotEmpty)
-                          const SizedBox(height: 16),
-
-                        // Completed recordings
-                        ..._recordings.asMap().entries.map((entry) {
-                          final idx = entry.key;
-                          final rec = entry.value;
-                          return _RecordingTranscriptTile(
-                            index: idx + 1,
-                            recording: rec,
-                            onPlayTap: () => _playRecording(rec),
-                          );
-                        }),
-
-                        // Batch-mode status tiles
-                        if (!_streamEnabled && _isRecording)
-                          _StatusTile(
-                            color: AppColors.error,
-                            label: _isPaused
-                                ? 'Recording paused'
-                                : 'Recording… transcript will appear after you stop',
-                            showSpinner: false,
-                          ),
-                        if (_transcribingIds.isNotEmpty)
-                          _StatusTile(
-                            color: AppColors.primary,
-                            label:
-                                'Transcribing with ${_sttProvider.shortLabel} (${_transcribingIds.length})…',
-                            showSpinner: true,
-                          ),
-                      ],
-                    ),
-                  ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildTranscriptEmptyState() {
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(
-            _streamEnabled
-                ? Icons.graphic_eq_rounded
-                : Icons.record_voice_over_outlined,
-            size: 36,
-            color: AppColors.textHint.withOpacity(0.4),
-          ),
-          const SizedBox(height: 10),
-          Text(
-            _streamEnabled
-                ? 'Live mode is ON — transcripts appear every ${_chunkInterval.inSeconds}s while you speak'
-                : 'Your dictation will appear here after you stop',
-            textAlign: TextAlign.center,
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  color: AppColors.textHint,
-                ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildLiveStreamPanel() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: [
-            AppColors.error.withOpacity(0.04),
-            AppColors.primary.withOpacity(0.02),
-          ],
-        ),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: AppColors.error.withOpacity(0.25)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              _LivePulseDot(animation: _pulseAnimation),
-              const SizedBox(width: 8),
-              Text(
-                'Streaming via ${_sttProvider.shortLabel}',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: AppColors.error,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 0.4,
-                    ),
+              if (widget.onBack != null)
+                IconButton(
+                  tooltip: 'Back',
+                  onPressed: widget.onBack,
+                  icon: const Icon(Icons.arrow_back_rounded),
+                ),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [AppColors.primary, AppColors.primaryLight],
+                  ),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Icon(Icons.mic_rounded,
+                    color: Colors.white, size: 20),
+              ),
+              const SizedBox(width: 12),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('Voice Report',
+                      style: Theme.of(context).textTheme.titleLarge),
+                  Text('Speak or tap — both work',
+                      style: Theme.of(context).textTheme.bodySmall),
+                ],
               ),
               const Spacer(),
-              Text(
-                _formatDuration(_recordingDuration),
-                style: const TextStyle(
-                  fontFamily: 'monospace',
-                  color: AppColors.error,
-                  fontWeight: FontWeight.w700,
-                  fontSize: 12,
-                ),
+              IconButton(
+                tooltip: _showDebugLog ? 'Hide debug log' : 'Show debug log',
+                icon: Icon(_showDebugLog
+                    ? Icons.bug_report_rounded
+                    : Icons.bug_report_outlined),
+                onPressed: () =>
+                    setState(() => _showDebugLog = !_showDebugLog),
               ),
+              const SizedBox(width: 4),
+              _listeningIndicator(),
             ],
           ),
           const SizedBox(height: 10),
-          if (_liveChunks.isEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              child: Row(
-                children: [
-                  SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      valueColor:
-                          AlwaysStoppedAnimation<Color>(AppColors.error),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Text(
-                    'Listening — first chunk in ${_chunkInterval.inSeconds}s…',
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: AppColors.textSecondary,
-                        ),
-                  ),
-                ],
-              ),
-            )
-          else
-            Wrap(
-              spacing: 0,
-              runSpacing: 4,
-              children: _liveChunks
-                  .asMap()
-                  .entries
-                  .map((e) => _LiveChunkSpan(
-                        index: e.key + 1,
-                        chunk: e.value,
-                      ))
-                  .toList(),
-            ),
+          _manualControls(),
         ],
       ),
     );
   }
 
-  // ─── RIGHT PANEL: Generated Report ─────────────────────────────
 
-  Widget _buildReportPanel() {
-    return Container(
-      color: AppColors.background,
-      child: _reportGenerated && _generatedReport != null
-          ? _buildGeneratedReportView()
-          : _buildReportPlaceholder(),
+  Widget _manualControls() {
+    final canStart = _confirmedPatientId.isNotEmpty &&
+        (_state == _VoiceState.readyToRecord ||
+            _state == _VoiceState.saved);
+    final isRecording = _state == _VoiceState.recording;
+    final isPaused = _state == _VoiceState.paused;
+    final canGenerate = _dictationText.trim().isNotEmpty &&
+        _state != _VoiceState.generating &&
+        _state != _VoiceState.transcribing;
+    final canSave = _state == _VoiceState.reportReady;
+
+    return Row(
+      children: [
+        // Patient ID input
+        SizedBox(
+          width: 240,
+          child: TextField(
+            controller: _patientIdCtrl,
+            textCapitalization: TextCapitalization.characters,
+            decoration: InputDecoration(
+              hintText: 'Patient ID / MRN',
+              isDense: true,
+              prefixIcon: const Icon(Icons.badge_outlined, size: 18),
+              contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 10, vertical: 10),
+              suffixIcon: IconButton(
+                tooltip: 'Confirm patient ID',
+                icon: const Icon(Icons.check_rounded, size: 18),
+                onPressed: () => _setPatientIdManually(_patientIdCtrl.text),
+              ),
+            ),
+            style: const TextStyle(fontSize: 13),
+            onSubmitted: _setPatientIdManually,
+          ),
+        ),
+        const SizedBox(width: 12),
+        // Record controls
+        _btn(
+          icon: Icons.fiber_manual_record_rounded,
+          label: 'Start',
+          color: AppColors.error,
+          onTap: canStart ? _startRecording : null,
+          filled: true,
+        ),
+        const SizedBox(width: 6),
+        _btn(
+          icon: isPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+          label: isPaused ? 'Resume' : 'Pause',
+          color: AppColors.warning,
+          onTap: isRecording
+              ? _pauseRecording
+              : (isPaused ? _resumeRecording : null),
+        ),
+        const SizedBox(width: 6),
+        _btn(
+          icon: Icons.stop_rounded,
+          label: 'Stop',
+          color: AppColors.primary,
+          onTap: (isRecording || isPaused) ? _stopRecording : null,
+        ),
+        const SizedBox(width: 6),
+        _btn(
+          icon: Icons.auto_awesome,
+          label: 'Generate',
+          color: AppColors.info,
+          onTap: canGenerate ? _generateReport : null,
+        ),
+        const Spacer(),
+        _btn(
+          icon: Icons.delete_outline_rounded,
+          label: 'Discard',
+          color: AppColors.textHint,
+          onTap: _state == _VoiceState.reportReady ||
+                  _state == _VoiceState.saved
+              ? _reset
+              : null,
+        ),
+        const SizedBox(width: 6),
+        _btn(
+          icon: Icons.save_rounded,
+          label: 'Save',
+          color: AppColors.success,
+          onTap: canSave ? _saveReport : null,
+          filled: true,
+        ),
+      ],
     );
   }
 
-  Widget _buildReportPlaceholder() {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(40),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(24),
-              decoration: BoxDecoration(
-                color: AppColors.primary.withOpacity(0.06),
-                shape: BoxShape.circle,
-              ),
-              child: Icon(
-                Icons.auto_awesome,
-                size: 48,
-                color: AppColors.primary.withOpacity(0.4),
-              ),
+  Widget _btn({
+    required IconData icon,
+    required String label,
+    required Color color,
+    required VoidCallback? onTap,
+    bool filled = false,
+  }) {
+    final disabled = onTap == null;
+    final bg = filled
+        ? (disabled ? AppColors.textHint.withOpacity(0.2) : color)
+        : Colors.transparent;
+    final fg = filled
+        ? Colors.white
+        : (disabled ? AppColors.textHint : color);
+    return Opacity(
+      opacity: disabled ? 0.55 : 1,
+      child: Material(
+        color: bg,
+        borderRadius: BorderRadius.circular(10),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(10),
+          child: Container(
+            padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(10),
+              border: filled
+                  ? null
+                  : Border.all(
+                      color: disabled ? AppColors.border : color, width: 1),
             ),
-            const SizedBox(height: 20),
-            Text(
-              'Report Preview',
-              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                    color: AppColors.textHint,
-                  ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 16, color: fg),
+                const SizedBox(width: 6),
+                Text(label,
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: fg)),
+              ],
             ),
-            const SizedBox(height: 8),
-            Text(
-              'Record your findings, then click "Generate Report"\nto create a structured pathology report with AI.',
-              textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: AppColors.textHint,
-                    height: 1.5,
-                  ),
-            ),
-            const SizedBox(height: 24),
-            // Workflow steps
-            _WorkflowStep(number: '1', text: 'Dictate your findings'),
-            _WorkflowStep(number: '2', text: 'Review the live transcript'),
-            _WorkflowStep(number: '3', text: 'Click Generate Report'),
-            _WorkflowStep(number: '4', text: 'Review, edit & save'),
-          ],
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildGeneratedReportView() {
-    final r = _generatedReport!;
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Summary banner
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(20),
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                colors: [
-                  AppColors.success.withOpacity(0.08),
-                  AppColors.primary.withOpacity(0.05),
-                ],
-              ),
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: AppColors.success.withOpacity(0.3)),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    const Icon(Icons.auto_awesome,
-                        color: AppColors.success, size: 18),
-                    const SizedBox(width: 8),
-                    Text(
-                      'AI-Generated Summary',
-                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                            color: AppColors.success,
-                          ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Text(
-                  r['summary'] ?? _generatedSummary,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodyLarge
-                      ?.copyWith(height: 1.6),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
-
-          // Patient
-          _ReportSection(
-            title: 'Patient Information',
-            icon: Icons.person_rounded,
-            fields: {
-              'Name': r['patient_name'] ?? _patientNameCtrl.text,
-              'Age': r['patient_age'] ?? _patientAgeCtrl.text,
-              'Gender': r['patient_gender'] ?? _selectedGender,
-              'Referring Doctor': r['referring_doctor'] ?? '',
-              'Hospital ID': r['hospital_id'] ?? '',
-            },
-          ),
-          const SizedBox(height: 12),
-
-          // Specimen
-          _ReportSection(
-            title: 'Specimen Details',
-            icon: Icons.science_rounded,
-            fields: {
-              'Type': r['specimen_type'] ?? '',
-              'Site': r['specimen_site'] ?? '',
-              'Clinical History': r['clinical_history'] ?? '',
-              'Gross Description': r['gross_description'] ?? '',
-            },
-          ),
-          const SizedBox(height: 12),
-
-          // Findings
-          _ReportSection(
-            title: 'Pathology Findings',
-            icon: Icons.biotech_rounded,
-            fields: {
-              'Microscopic Description': r['microscopic_description'] ?? '',
-              'Diagnosis': r['diagnosis'] ?? '',
-              'Grade': r['grade'] ?? '',
-              'Stage': r['stage'] ?? '',
-            },
-            highlightField: 'Diagnosis',
-          ),
-          const SizedBox(height: 12),
-
-          // Additional
-          if ((r['immunohistochemistry'] ?? '').isNotEmpty ||
-              (r['special_stains'] ?? '').isNotEmpty ||
-              (r['molecular_studies'] ?? '').isNotEmpty)
-            _ReportSection(
-              title: 'Additional Studies',
-              icon: Icons.hub_rounded,
-              fields: {
-                'IHC': r['immunohistochemistry'] ?? '',
-                'Special Stains': r['special_stains'] ?? '',
-                'Molecular Studies': r['molecular_studies'] ?? '',
-              },
-            ),
-
-          if ((r['comments'] ?? '').isNotEmpty) ...[
-            const SizedBox(height: 12),
-            _ReportSection(
-              title: 'Comments',
-              icon: Icons.comment_rounded,
-              fields: {'': r['comments']!},
-            ),
-          ],
-
-          const SizedBox(height: 16),
-
-          // Raw transcript toggle
-          Container(
-            width: double.infinity,
-            decoration: BoxDecoration(
-              color: AppColors.surface,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: AppColors.border),
-            ),
-            child: ExpansionTile(
-              leading: const Icon(Icons.record_voice_over_outlined,
-                  color: AppColors.warning, size: 20),
-              title: Text('Raw Voice Transcript',
-                  style: Theme.of(context).textTheme.titleMedium),
-              subtitle: Text(
-                  '${_recordings.length} recording(s) — tap to review',
-                  style: Theme.of(context).textTheme.bodySmall),
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                  child: Column(
-                    children: _recordings.asMap().entries.map((entry) {
-                      final rec = entry.value;
-                      return Container(
-                        width: double.infinity,
-                        margin: const EdgeInsets.only(bottom: 8),
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: AppColors.surfaceVariant,
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Icon(Icons.play_circle_filled,
-                                    color: AppColors.primary, size: 20),
-                                const SizedBox(width: 8),
-                                Text(
-                                  'Recording ${entry.key + 1} — ${_formatDuration(rec.duration)}',
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .titleMedium
-                                      ?.copyWith(fontSize: 13),
-                                ),
-                                const Spacer(),
-                                Text(
-                                  'Tap to play',
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .bodySmall
-                                      ?.copyWith(color: AppColors.primary),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              rec.transcription,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
-                                  ?.copyWith(
-                                    height: 1.5,
-                                    fontStyle: FontStyle.italic,
-                                  ),
-                            ),
-                          ],
-                        ),
-                      );
-                    }).toList(),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 40),
-        ],
-      ),
-    );
-  }
-
-  // ─── Actions ───────────────────────────────────────────────────
-
-  Future<void> _startRecording() async {
-    final path = _streamEnabled
-        ? await _audioService.startStreamRecording()
-        : await _audioService.startRecording();
-    if (path != null) {
-      setState(() {
-        _isRecording = true;
-        _isPaused = false;
-        _waveformData.clear();
-        if (_streamEnabled) {
-          _liveChunks.clear();
-        }
-      });
-      if (_streamEnabled) {
-        _chunkTimer = Timer.periodic(_chunkInterval, (_) => _rotateChunk());
-      }
-    } else {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text(
-                'Microphone permission required. Please grant access in System Settings.'),
-            backgroundColor: AppColors.error,
-            behavior: SnackBarBehavior.floating,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-          ),
-        );
-      }
-    }
-  }
-
-  Future<void> _rotateChunk() async {
-    if (!_isRecording || _isPaused) return;
-    final finishedPath = await _audioService.rotateRecording();
-    if (finishedPath == null || finishedPath.isEmpty) return;
-    _transcribeLiveChunk(finishedPath);
-  }
-
-  void _transcribeLiveChunk(String filePath) {
-    final chunk = _LiveChunk(filePath: filePath);
-    setState(() {
-      _liveChunks.add(chunk);
-      _liveChunksInFlight++;
-    });
-
-    () async {
-      try {
-        final text = await SttService.transcribe(filePath, _sttProvider);
-        if (!mounted) return;
-        setState(() {
-          chunk.text = text.trim();
-          chunk.status = _LiveChunkStatus.done;
-          _liveChunksInFlight =
-              (_liveChunksInFlight - 1).clamp(0, 1 << 30);
-        });
-        _autoScrollTranscript();
-      } catch (e) {
-        if (!mounted) return;
-        setState(() {
-          chunk.status = _LiveChunkStatus.failed;
-          chunk.text = '(failed: $e)';
-          _liveChunksInFlight =
-              (_liveChunksInFlight - 1).clamp(0, 1 << 30);
-        });
-      }
-    }();
-  }
-
-  void _autoScrollTranscript() {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_transcriptScrollCtrl.hasClients) {
-        _transcriptScrollCtrl.animateTo(
-          _transcriptScrollCtrl.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 240),
-          curve: Curves.easeOut,
-        );
-      }
-    });
-  }
-
-  Future<void> _pauseRecording() async {
-    await _audioService.pauseRecording();
-    setState(() {
-      _isPaused = true;
-      _isRecording = true;
-    });
-  }
-
-  Future<void> _resumeRecording() async {
-    await _audioService.resumeRecording();
-    setState(() {
-      _isPaused = false;
-      _isRecording = true;
-    });
-  }
-
-  Future<void> _stopRecording() async {
-    if (_streamEnabled) {
-      await _stopStreamRecording();
-      return;
-    }
-
-    final path = await _audioService.stopRecording();
-    final duration = _recordingDuration;
-
-    final recording = VoiceRecording(
-      filePath: path ?? '',
-      transcription: '',
-      duration: duration,
-      label: 'Recording ${_recordings.length + 1}',
-    );
-
-    setState(() {
-      _isRecording = false;
-      _isPaused = false;
-      _recordings.add(recording);
-      _transcribingIds.add(recording.id);
-      _recordingDuration = Duration.zero;
-      _waveformData.clear();
-    });
-
-    _transcribeRecording(recording);
-  }
-
-  Future<void> _stopStreamRecording() async {
-    _chunkTimer?.cancel();
-    _chunkTimer = null;
-
-    final finalPath = await _audioService.stopRecording();
-    final duration = _recordingDuration;
-
-    // Transcribe the trailing chunk (from last rotation to stop).
-    if (finalPath != null && finalPath.isNotEmpty) {
-      _transcribeLiveChunk(finalPath);
-    }
-
-    setState(() {
-      _isRecording = false;
-      _isPaused = false;
-      _recordingDuration = Duration.zero;
-      _waveformData.clear();
-    });
-
-    // Wait for remaining chunks to finish, then fold the session into a
-    // single VoiceRecording entry (matches batch-mode UX).
-    await _finalizeStreamSession(duration);
-  }
-
-  Future<void> _finalizeStreamSession(Duration totalDuration) async {
-    // Poll briefly for in-flight chunks (capped, so UI never hangs).
-    for (int i = 0; i < 60 && _liveChunksInFlight > 0; i++) {
-      await Future.delayed(const Duration(milliseconds: 250));
-    }
-    if (!mounted) return;
-
-    final combined = _liveChunks
-        .where((c) => c.status == _LiveChunkStatus.done && c.text.isNotEmpty)
-        .map((c) => c.text)
-        .join(' ')
-        .trim();
-
-    final recording = VoiceRecording(
-      filePath: _liveChunks.isNotEmpty ? _liveChunks.last.filePath : '',
-      transcription: combined,
-      duration: totalDuration,
-      label: 'Recording ${_recordings.length + 1}',
-    );
-
-    setState(() {
-      _recordings.add(recording);
-      _fullTranscript = _recordings
-          .where((r) => r.transcription.isNotEmpty)
-          .map((r) => r.transcription)
-          .join('\n\n');
-      _liveChunks.clear();
-    });
-  }
-
-  Widget _buildStreamToggle() {
-    final active = _streamEnabled;
-    final enabled = !_isRecording && !_isPaused;
-    return Tooltip(
-      message: active
-          ? 'Live streaming transcription — transcripts appear every ${_chunkInterval.inSeconds}s while you speak'
-          : 'Batch mode — full transcript appears after you stop',
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 180),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-        decoration: BoxDecoration(
-          color: active
-              ? AppColors.error.withOpacity(0.08)
-              : AppColors.surface,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(
-            color: active ? AppColors.error.withOpacity(0.45) : AppColors.border,
-          ),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
+  Widget _listeningIndicator() {
+    return StreamBuilder<String>(
+      stream: _voice.status,
+      builder: (context, snap) {
+        final listening = _voice.isListening;
+        return Row(
           children: [
             AnimatedBuilder(
-              animation: _pulseAnimation,
-              builder: (context, _) {
-                return Container(
-                  width: 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: active
-                        ? AppColors.error.withOpacity(
-                            0.4 + 0.6 * ((_pulseAnimation.value - 1.0) / 0.3))
-                        : AppColors.textHint.withOpacity(0.4),
-                  ),
-                );
-              },
-            ),
-            const SizedBox(width: 8),
-            Text(
-              active ? 'LIVE' : 'Live',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: active ? AppColors.error : AppColors.textSecondary,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: active ? 1.2 : 0.2,
-                  ),
-            ),
-            const SizedBox(width: 6),
-            Transform.scale(
-              scale: 0.8,
-              child: Switch(
-                value: active,
-                onChanged: enabled
-                    ? (v) => setState(() => _streamEnabled = v)
-                    : null,
-                activeColor: AppColors.error,
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              animation: _pulseAnim,
+              builder: (_, child) => Transform.scale(
+                scale: listening ? _pulseAnim.value : 1,
+                child: child,
+              ),
+              child: Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: listening ? AppColors.success : AppColors.textHint,
+                ),
               ),
             ),
+            const SizedBox(width: 8),
+            Text(listening ? 'Listening' : 'Idle',
+                style: Theme.of(context).textTheme.bodySmall),
           ],
-        ),
+        );
+      },
+    );
+  }
+
+  // left panel: big state visual + status
+  Widget _leftPanel() {
+    return Container(
+      color: AppColors.background,
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _stateCard(),
+          const SizedBox(height: 20),
+          Expanded(child: _recordingsList()),
+        ],
       ),
     );
   }
 
-  Widget _buildSttProviderSelector() {
+  Widget _stateCard() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
         color: AppColors.surface,
-        borderRadius: BorderRadius.circular(8),
+        borderRadius: BorderRadius.circular(16),
         border: Border.all(color: AppColors.border),
+      ),
+      child: Column(
+        children: [
+          _stateVisual(),
+          const SizedBox(height: 16),
+          Text(_statusMessage,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          if (_liveTranscript.isNotEmpty)
+            Text('"${_liveTranscript.toLowerCase()}"',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodySmall),
+          if (_state == _VoiceState.confirmingPatientId) ...[
+            const SizedBox(height: 12),
+            _idChip(_candidatePatientId),
+          ],
+          if (_confirmedPatientId.isNotEmpty &&
+              _state != _VoiceState.awaitingPatientId &&
+              _state != _VoiceState.confirmingPatientId) ...[
+            const SizedBox(height: 8),
+            _idChip(_confirmedPatientId, confirmed: true),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _stateVisual() {
+    switch (_state) {
+      case _VoiceState.recording:
+      case _VoiceState.paused:
+        return SizedBox(
+          height: 60,
+          child: CustomPaint(
+            painter: _WaveformPainter(
+              data: _waveform,
+              color: _state == _VoiceState.paused
+                  ? AppColors.warning
+                  : AppColors.error,
+            ),
+            size: const Size(double.infinity, 60),
+          ),
+        );
+      case _VoiceState.transcribing:
+      case _VoiceState.generating:
+        return const SizedBox(
+          height: 60,
+          child: Center(
+            child: SizedBox(
+              width: 32,
+              height: 32,
+              child: CircularProgressIndicator(strokeWidth: 3),
+            ),
+          ),
+        );
+      default:
+        return AnimatedBuilder(
+          animation: _pulseAnim,
+          builder: (_, child) => Transform.scale(
+            scale: _pulseAnim.value,
+            child: child,
+          ),
+          child: Container(
+            width: 64,
+            height: 64,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: _stateColor().withOpacity(0.15),
+            ),
+            child: Icon(_stateIcon(), size: 30, color: _stateColor()),
+          ),
+        );
+    }
+  }
+
+  Color _stateColor() {
+    switch (_state) {
+      case _VoiceState.awaitingPatientId:
+      case _VoiceState.confirmingPatientId:
+        return AppColors.info;
+      case _VoiceState.readyToRecord:
+        return AppColors.primary;
+      case _VoiceState.reportReady:
+        return AppColors.success;
+      case _VoiceState.saved:
+        return AppColors.completed;
+      default:
+        return AppColors.primary;
+    }
+  }
+
+  IconData _stateIcon() {
+    switch (_state) {
+      case _VoiceState.awaitingPatientId:
+        return Icons.badge_outlined;
+      case _VoiceState.confirmingPatientId:
+        return Icons.check_circle_outline;
+      case _VoiceState.readyToRecord:
+        return Icons.mic_none_rounded;
+      case _VoiceState.reportReady:
+        return Icons.description_outlined;
+      case _VoiceState.saved:
+        return Icons.check_circle_rounded;
+      default:
+        return Icons.mic_rounded;
+    }
+  }
+
+  Widget _idChip(String id, {bool confirmed = false}) {
+    final color = confirmed ? AppColors.success : AppColors.info;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(20),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.graphic_eq_rounded,
-              size: 16, color: AppColors.primary),
+          Icon(confirmed ? Icons.check_rounded : Icons.badge_outlined,
+              size: 16, color: color),
           const SizedBox(width: 6),
-          Text(
-            'STT:',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: AppColors.textSecondary,
-                  fontWeight: FontWeight.w600,
-                ),
-          ),
-          const SizedBox(width: 6),
-          DropdownButtonHideUnderline(
-            child: DropdownButton<SttProvider>(
-              value: _sttProvider,
-              isDense: true,
-              icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 18),
-              style: Theme.of(context).textTheme.bodyMedium,
-              items: SttProvider.values
-                  .map((p) => DropdownMenuItem(
-                        value: p,
-                        child: Text(p.label),
-                      ))
-                  .toList(),
-              onChanged: (v) {
-                if (v != null) setState(() => _sttProvider = v);
-              },
-            ),
-          ),
+          Text(id,
+              style: TextStyle(
+                  color: color,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.8)),
         ],
       ),
     );
   }
 
-  Future<void> _transcribeRecording(VoiceRecording recording) async {
-    try {
-      final text = await SttService.transcribe(recording.filePath, _sttProvider);
-      if (!mounted) return;
-
-      setState(() {
-        final idx = _recordings.indexWhere((r) => r.id == recording.id);
-        if (idx != -1) {
-          _recordings[idx] = _recordings[idx].copyWith(transcription: text);
-        }
-        _transcribingIds.remove(recording.id);
-        _fullTranscript = _recordings
-            .where((r) => r.transcription.isNotEmpty)
-            .map((r) => r.transcription)
-            .join('\n\n');
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _transcribingIds.remove(recording.id));
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Transcription failed: $e'),
-          backgroundColor: AppColors.error,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+  Widget _recordingsList() {
+    if (_recordings.isEmpty && _dictationText.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.graphic_eq_rounded,
+                size: 40, color: AppColors.textHint.withOpacity(0.5)),
+            const SizedBox(height: 8),
+            Text('Dictation transcript will appear here',
+                style: Theme.of(context).textTheme.bodySmall),
+          ],
         ),
       );
     }
-  }
-
-  Future<void> _discardRecording() async {
-    _chunkTimer?.cancel();
-    _chunkTimer = null;
-    await _audioService.stopRecording();
-    setState(() {
-      _isRecording = false;
-      _isPaused = false;
-      _recordingDuration = Duration.zero;
-      _waveformData.clear();
-      _liveChunks.clear();
-      _liveChunksInFlight = 0;
-    });
-  }
-
-  void _playRecording(VoiceRecording rec) {
-    // Show audio player in a modal bottom sheet
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      backgroundColor: AppColors.background,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppColors.border),
       ),
-      builder: (context) => Padding(
-        padding: const EdgeInsets.all(20),
-        child: AudioPlayerWidget(
-          filePath: rec.filePath,
-          title: rec.label,
-          onClose: () => Navigator.pop(context),
+      padding: const EdgeInsets.all(16),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.text_snippet_outlined,
+                    size: 16, color: AppColors.primary),
+                const SizedBox(width: 6),
+                Text('Transcript',
+                    style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(width: 6),
+                if (_recordings.isNotEmpty)
+                  Text('· ${_recordings.length} clip(s)',
+                      style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(_dictationText.isEmpty ? '…' : _dictationText,
+                style: Theme.of(context).textTheme.bodyMedium),
+          ],
         ),
       ),
     );
   }
 
-  Future<void> _generateFullReport() async {
-    if (_fullTranscript.isEmpty) return;
+  // right panel: generated report preview
+  Widget _rightPanel() {
+    return Container(
+      color: AppColors.background,
+      padding: const EdgeInsets.all(24),
+      child: _workingReport == null
+          ? _emptyReport()
+          : _reportPreview(_workingReport!),
+    );
+  }
 
-    setState(() => _isGenerating = true);
+  Widget _emptyReport() {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.description_outlined,
+              size: 48, color: AppColors.textHint.withOpacity(0.5)),
+          const SizedBox(height: 8),
+          Text('Generated report will appear here',
+              style: Theme.of(context).textTheme.bodyMedium),
+        ],
+      ),
+    );
+  }
 
-    try {
-      final patientContext = _patientNameCtrl.text.isNotEmpty
-          ? 'Patient: ${_patientNameCtrl.text}, Age: ${_patientAgeCtrl.text}, Gender: $_selectedGender'
-          : '';
+  Widget _reportPreview(PathologyReport r) {
+    final fmt = DateFormat('dd-MM-yyyy hh:mm a');
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppColors.border),
+      ),
+      padding: const EdgeInsets.all(24),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Center(
+              child: Text('DEPARTMENT OF LABORATORY MEDICINE',
+                  style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 0.4)),
+            ),
+            const SizedBox(height: 12),
+            _infoGrid(r, fmt),
+            const Divider(height: 24),
+            const Center(
+              child: Text('HISTOPATHOLOGY REPORT',
+                  style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w800,
+                      decoration: TextDecoration.underline)),
+            ),
+            const SizedBox(height: 10),
+            _line('LAB NUMBER', r.reportNumber),
+            _section('CLINICAL INFORMATION', r.clinicalInformation),
+            _section('SPECIMEN', r.specimen),
+            _section('GROSS EXAMINATION', r.grossExamination),
+            _section('MICROSCOPY AND IMPRESSION', r.microscopyImpression),
+            const SizedBox(height: 20),
+            Align(
+              alignment: Alignment.centerRight,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(r.pathologistName,
+                      style: Theme.of(context).textTheme.titleMedium),
+                  Text(r.pathologistRegistration,
+                      style: Theme.of(context).textTheme.bodySmall),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
-      final result = await GeminiService.generateReportFromTranscript(
-        _fullTranscript,
-        patientContext: patientContext,
-      );
-
-      setState(() {
-        _generatedReport = result;
-        _generatedSummary = result['summary'] ?? '';
-        _reportGenerated = true;
-        _isGenerating = false;
-      });
-    } catch (e) {
-      setState(() => _isGenerating = false);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error generating report: $e'),
-            backgroundColor: AppColors.error,
-            behavior: SnackBarBehavior.floating,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+  Widget _infoGrid(PathologyReport r, DateFormat fmt) {
+    Widget row(String l, String v) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 110,
+                child: Text(l,
+                    style: const TextStyle(
+                        fontSize: 12, fontWeight: FontWeight.w600)),
+              ),
+              const Text(': '),
+              Expanded(
+                child: Text(v, style: const TextStyle(fontSize: 12)),
+              ),
+            ],
           ),
         );
-      }
-    }
-  }
-
-  void _saveReport() {
-    if (_generatedReport == null) return;
-    final r = _generatedReport!;
-
-    final report = PathologyReport(
-      reportNumber:
-          'PATH-2026-${DateTime.now().millisecondsSinceEpoch.toString().substring(7)}',
-      patient: Patient(
-        name: r['patient_name']?.isNotEmpty == true
-            ? r['patient_name']!
-            : _patientNameCtrl.text,
-        age: int.tryParse(r['patient_age'] ?? _patientAgeCtrl.text) ?? 0,
-        gender: r['patient_gender']?.isNotEmpty == true
-            ? r['patient_gender']!
-            : _selectedGender,
-        referringDoctor: r['referring_doctor'] ?? '',
-        hospitalId: r['hospital_id'] ?? '',
-      ),
-      specimen: Specimen(
-        type: SpecimenType.biopsy,
-        site: r['specimen_site'] ?? '',
-        collectionDate: '',
-        receivedDate: '',
-        clinicalHistory: r['clinical_history'] ?? '',
-        grossDescription: r['gross_description'] ?? '',
-      ),
-      findings: PathologyFinding(
-        microscopicDescription: r['microscopic_description'] ?? '',
-        diagnosis: r['diagnosis'] ?? '',
-        grade: r['grade'] ?? '',
-        stage: r['stage'] ?? '',
-        immunohistochemistry: r['immunohistochemistry'] ?? '',
-        specialStains: r['special_stains'] ?? '',
-        molecularStudies: r['molecular_studies'] ?? '',
-        comments: r['comments'] ?? '',
-      ),
-      status: ReportStatus.completed,
-      pathologistName: 'Dr. Anand Patel',
-      summary: _generatedSummary,
-      voiceRecordings: _recordings,
-      rawTranscript: _fullTranscript,
-    );
-
-    widget.onReportSaved?.call(report);
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: const Text('Report saved successfully!'),
-        backgroundColor: AppColors.success,
-        behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-      ),
-    );
-  }
-
-  String _formatDuration(Duration d) {
-    final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return '$minutes:$seconds';
-  }
-}
-
-// ─── Supporting Widgets ─────────────────────────────────────────
-
-class _ControlButton extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final Color color;
-  final VoidCallback onTap;
-  final bool large;
-
-  const _ControlButton({
-    required this.icon,
-    required this.label,
-    required this.color,
-    required this.onTap,
-    this.large = false,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Material(
-          color: color.withOpacity(0.1),
-          shape: const CircleBorder(),
-          child: InkWell(
-            onTap: onTap,
-            customBorder: const CircleBorder(),
-            child: Container(
-              width: large ? 64 : 48,
-              height: large ? 64 : 48,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                border: Border.all(color: color.withOpacity(0.3), width: 2),
-              ),
-              child: Icon(icon, color: color, size: large ? 30 : 22),
-            ),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              row('Name', r.patientName.isEmpty ? '—' : r.patientName),
+              row('MRN', r.mrn.isEmpty ? r.patientId : r.mrn),
+              row('Age', r.patientAge > 0 ? 'Y ${r.patientAge} Y' : '—'),
+              row('Ordered by', r.orderedBy.isEmpty ? '—' : r.orderedBy),
+              row('Referred by', r.referredBy.isEmpty ? '—' : r.referredBy),
+            ],
           ),
         ),
-        const SizedBox(height: 6),
-        Text(
-          label,
-          style: TextStyle(
-            color: color,
-            fontSize: 11,
-            fontWeight: FontWeight.w600,
+        const SizedBox(width: 16),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              row('Lab No', r.labNo.isEmpty ? '—' : r.labNo),
+              row('Visit No', r.visitNo.isEmpty ? '—' : r.visitNo),
+              row('Gender', r.patientGender.isEmpty ? '—' : r.patientGender),
+              row('Sample Receipt', fmt.format(r.sampleReceiptDate)),
+              row('Reported', fmt.format(r.reportedDate)),
+            ],
           ),
         ),
       ],
     );
   }
-}
 
-class _RecordingTranscriptTile extends StatelessWidget {
-  final int index;
-  final VoiceRecording recording;
-  final VoidCallback onPlayTap;
-
-  const _RecordingTranscriptTile({
-    required this.index,
-    required this.recording,
-    required this.onPlayTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final minutes =
-        recording.duration.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final seconds =
-        recording.duration.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: AppColors.surfaceVariant,
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              InkWell(
-                onTap: onPlayTap,
-                borderRadius: BorderRadius.circular(20),
-                child: Container(
-                  padding: const EdgeInsets.all(6),
-                  decoration: BoxDecoration(
-                    color: AppColors.primary.withOpacity(0.1),
-                    shape: BoxShape.circle,
-                  ),
-                  child: const Icon(Icons.play_arrow_rounded,
-                      color: AppColors.primary, size: 18),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Text(
-                'Recording $index',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
-                    ),
-              ),
-              const SizedBox(width: 8),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: AppColors.primary.withOpacity(0.08),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Text(
-                  '$minutes:$seconds',
-                  style: const TextStyle(
-                    fontSize: 11,
-                    color: AppColors.primary,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-              const Spacer(),
-              Icon(Icons.check_circle, color: AppColors.success, size: 16),
-              const SizedBox(width: 4),
-              Text('Transcribed',
-                  style: TextStyle(
-                      fontSize: 11,
-                      color: AppColors.success,
-                      fontWeight: FontWeight.w500)),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Text(
-            recording.transcription,
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  height: 1.6,
-                  color: AppColors.textPrimary,
-                ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _WorkflowStep extends StatelessWidget {
-  final String number;
-  final String text;
-
-  const _WorkflowStep({required this.number, required this.text});
-
-  @override
-  Widget build(BuildContext context) {
+  Widget _line(String label, String value) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
+      padding: const EdgeInsets.symmetric(vertical: 2),
       child: Row(
-        mainAxisSize: MainAxisSize.min,
         children: [
-          Container(
-            width: 26,
-            height: 26,
-            decoration: BoxDecoration(
-              color: AppColors.primary.withOpacity(0.1),
-              shape: BoxShape.circle,
-            ),
-            child: Center(
-              child: Text(
-                number,
+          SizedBox(
+            width: 110,
+            child: Text(label,
                 style: const TextStyle(
-                  color: AppColors.primary,
-                  fontWeight: FontWeight.w700,
-                  fontSize: 12,
-                ),
-              ),
-            ),
+                    fontSize: 12, fontWeight: FontWeight.w700)),
           ),
-          const SizedBox(width: 10),
-          Text(text, style: Theme.of(context).textTheme.bodyMedium),
+          const Text(': '),
+          Expanded(child: Text(value, style: const TextStyle(fontSize: 12))),
         ],
       ),
     );
   }
-}
 
-class _ReportSection extends StatelessWidget {
-  final String title;
-  final IconData icon;
-  final Map<String, String> fields;
-  final String? highlightField;
-
-  const _ReportSection({
-    required this.title,
-    required this.icon,
-    required this.fields,
-    this.highlightField,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final nonEmptyFields =
-        Map.fromEntries(fields.entries.where((e) => e.value.isNotEmpty));
-    if (nonEmptyFields.isEmpty) return const SizedBox.shrink();
-
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: AppColors.surface,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: AppColors.border),
-      ),
+  Widget _section(String label, String body) {
+    if (body.trim().isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Icon(icon, color: AppColors.primary, size: 18),
-              const SizedBox(width: 8),
-              Text(title, style: Theme.of(context).textTheme.titleLarge),
-            ],
-          ),
-          const SizedBox(height: 12),
-          ...nonEmptyFields.entries.map((e) {
-            final isHighlight = e.key == highlightField;
-            if (e.key.isEmpty) {
-              return Padding(
-                padding: const EdgeInsets.only(bottom: 6),
-                child: Text(e.value,
-                    style: Theme.of(context)
-                        .textTheme
-                        .bodyLarge
-                        ?.copyWith(height: 1.5)),
-              );
-            }
-            return Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  SizedBox(
-                    width: 130,
-                    child: Text(
-                      e.key,
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(fontWeight: FontWeight.w500),
-                    ),
-                  ),
-                  Expanded(
-                    child: isHighlight
-                        ? Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 10, vertical: 6),
-                            decoration: BoxDecoration(
-                              color: AppColors.primary.withOpacity(0.08),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Text(
-                              e.value,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyLarge
-                                  ?.copyWith(
-                                    fontWeight: FontWeight.w600,
-                                    color: AppColors.primary,
-                                  ),
-                            ),
-                          )
-                        : Text(
-                            e.value,
-                            style: Theme.of(context)
-                                .textTheme
-                                .bodyLarge
-                                ?.copyWith(height: 1.5),
-                          ),
-                  ),
-                ],
-              ),
-            );
-          }),
+          Text(label,
+              style: const TextStyle(
+                  fontSize: 12, fontWeight: FontWeight.w700)),
+          const SizedBox(height: 4),
+          Text(body, style: const TextStyle(fontSize: 12, height: 1.4)),
         ],
       ),
     );
+  }
+
+  // bottom command hints (contextual)
+  Widget _commandHints() {
+    final phrases = SettingsService.getPhrases();
+    final hints = <String>[];
+    switch (_state) {
+      case _VoiceState.awaitingPatientId:
+        hints.add('"${_first(phrases[VoiceCommand.patientId.key])} LR 035643"');
+        break;
+      case _VoiceState.confirmingPatientId:
+        hints.add('"${_first(phrases[VoiceCommand.confirm.key])}"');
+        hints.add('"${_first(phrases[VoiceCommand.cancel.key])}"');
+        break;
+      case _VoiceState.readyToRecord:
+        hints.add('"${_first(phrases[VoiceCommand.start.key])}"');
+        break;
+      case _VoiceState.recording:
+        hints.add('"${_first(phrases[VoiceCommand.pause.key])}"');
+        hints.add('"${_first(phrases[VoiceCommand.stop.key])}"');
+        break;
+      case _VoiceState.paused:
+        hints.add('"${_first(phrases[VoiceCommand.resume.key])}"');
+        hints.add('"${_first(phrases[VoiceCommand.stop.key])}"');
+        break;
+      case _VoiceState.reportReady:
+        hints.add('"${_first(phrases[VoiceCommand.save.key])}"');
+        hints.add('"${_first(phrases[VoiceCommand.discard.key])}"');
+        break;
+      case _VoiceState.saved:
+        hints.add('"${_first(phrases[VoiceCommand.newReport.key])}"');
+        hints.add('"${_first(phrases[VoiceCommand.dashboard.key])}"');
+        break;
+      case _VoiceState.transcribing:
+      case _VoiceState.generating:
+        hints.add('processing…');
+        break;
+    }
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 10),
+      decoration: const BoxDecoration(
+        color: AppColors.surface,
+        border: Border(top: BorderSide(color: AppColors.border)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.lightbulb_outline_rounded,
+              size: 14, color: AppColors.textHint),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Wrap(
+              spacing: 10,
+              runSpacing: 4,
+              children: hints
+                  .map((h) => Text(h,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: AppColors.textSecondary,
+                          fontWeight: FontWeight.w500)))
+                  .toList(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _first(String? phrases) {
+    if (phrases == null || phrases.isEmpty) return '';
+    return phrases.split('|').first.trim();
   }
 }
 
 class _WaveformPainter extends CustomPainter {
   final List<double> data;
   final Color color;
-
   _WaveformPainter({required this.data, required this.color});
 
   @override
   void paint(Canvas canvas, Size size) {
     if (data.isEmpty) return;
-
     final paint = Paint()
-      ..color = color.withOpacity(0.6)
-      ..strokeWidth = 3
+      ..color = color
+      ..strokeWidth = 2
       ..strokeCap = StrokeCap.round;
-
-    final barWidth = size.width / 60;
-    final displayData =
-        data.length > 60 ? data.sublist(data.length - 60) : data;
-
-    for (int i = 0; i < displayData.length; i++) {
-      final x = i * barWidth + barWidth / 2;
-      final barHeight = displayData[i] * size.height * 0.8;
-      final y1 = size.height / 2 - barHeight / 2;
-      final y2 = size.height / 2 + barHeight / 2;
-      canvas.drawLine(Offset(x, y1), Offset(x, y2), paint);
+    final w = size.width / data.length;
+    for (var i = 0; i < data.length; i++) {
+      final x = i * w + w / 2;
+      final h = data[i] * size.height;
+      canvas.drawLine(Offset(x, (size.height - h) / 2),
+          Offset(x, (size.height + h) / 2), paint);
     }
   }
 
   @override
-  bool shouldRepaint(covariant _WaveformPainter oldDelegate) => true;
+  bool shouldRepaint(covariant _WaveformPainter old) =>
+      old.data != data || old.color != color;
 }
 
-class _StatusTile extends StatelessWidget {
-  final Color color;
-  final String label;
-  final bool showSpinner;
-
-  const _StatusTile({
-    required this.color,
-    required this.label,
-    required this.showSpinner,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.04),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: color.withOpacity(0.2)),
-      ),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 14,
-            height: 14,
-            child: showSpinner
-                ? CircularProgressIndicator(
-                    strokeWidth: 2,
-                    valueColor: AlwaysStoppedAnimation<Color>(color),
-                  )
-                : Container(
-                    decoration: BoxDecoration(
-                      color: color,
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              label,
-              style: Theme.of(context)
-                  .textTheme
-                  .bodyMedium
-                  ?.copyWith(color: color, fontWeight: FontWeight.w500),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ─── Live streaming helpers ────────────────────────────────────
-
-enum _LiveChunkStatus { pending, done, failed }
-
-class _LiveChunk {
-  final String filePath;
-  String text = '';
-  _LiveChunkStatus status = _LiveChunkStatus.pending;
-
-  _LiveChunk({required this.filePath});
-}
-
-class _LivePulseDot extends StatelessWidget {
-  final Animation<double> animation;
-  const _LivePulseDot({required this.animation});
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: animation,
-      builder: (context, _) {
-        final t = ((animation.value - 1.0) / 0.3).clamp(0.0, 1.0);
-        return Stack(
-          alignment: Alignment.center,
-          children: [
-            Container(
-              width: 14 + 6 * t,
-              height: 14 + 6 * t,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: AppColors.error.withOpacity(0.18 * (1 - t)),
-              ),
-            ),
-            Container(
-              width: 8,
-              height: 8,
-              decoration: const BoxDecoration(
-                shape: BoxShape.circle,
-                color: AppColors.error,
-              ),
-            ),
-          ],
-        );
-      },
-    );
-  }
-}
-
-class _MiniChip extends StatefulWidget {
-  final IconData icon;
-  final String label;
-  final String tooltip;
-  final Color color;
-  final bool spinning;
-
-  const _MiniChip({
-    required this.icon,
-    required this.label,
-    required this.tooltip,
-    required this.color,
-    this.spinning = false,
-  });
-
-  @override
-  State<_MiniChip> createState() => _MiniChipState();
-}
-
-class _MiniChipState extends State<_MiniChip>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _spin;
-
-  @override
-  void initState() {
-    super.initState();
-    _spin = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 900),
-    );
-    if (widget.spinning) _spin.repeat();
-  }
-
-  @override
-  void didUpdateWidget(covariant _MiniChip oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.spinning && !_spin.isAnimating) {
-      _spin.repeat();
-    } else if (!widget.spinning && _spin.isAnimating) {
-      _spin.stop();
-    }
-  }
-
-  @override
-  void dispose() {
-    _spin.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: widget.tooltip,
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-        decoration: BoxDecoration(
-          color: widget.color.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: widget.color.withOpacity(0.3)),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            RotationTransition(
-              turns: _spin,
-              child: Icon(widget.icon, size: 12, color: widget.color),
-            ),
-            const SizedBox(width: 4),
-            Text(
-              widget.label,
-              style: TextStyle(
-                color: widget.color,
-                fontSize: 11,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _LiveChunkSpan extends StatelessWidget {
-  final int index;
-  final _LiveChunk chunk;
-
-  const _LiveChunkSpan({required this.index, required this.chunk});
-
-  @override
-  Widget build(BuildContext context) {
-    switch (chunk.status) {
-      case _LiveChunkStatus.pending:
-        return Container(
-          margin: const EdgeInsets.only(right: 6, bottom: 2),
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          decoration: BoxDecoration(
-            color: AppColors.primary.withOpacity(0.08),
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(color: AppColors.primary.withOpacity(0.2)),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SizedBox(
-                width: 10,
-                height: 10,
-                child: CircularProgressIndicator(
-                  strokeWidth: 1.5,
-                  valueColor:
-                      AlwaysStoppedAnimation<Color>(AppColors.primary),
-                ),
-              ),
-              const SizedBox(width: 6),
-              Text(
-                'chunk $index',
-                style: const TextStyle(
-                  fontSize: 11,
-                  color: AppColors.primary,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ],
-          ),
-        );
-      case _LiveChunkStatus.failed:
-        return Container(
-          margin: const EdgeInsets.only(right: 6, bottom: 2),
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          decoration: BoxDecoration(
-            color: AppColors.error.withOpacity(0.08),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.error_outline,
-                  size: 12, color: AppColors.error),
-              const SizedBox(width: 4),
-              Text(
-                'chunk $index failed',
-                style: const TextStyle(
-                  fontSize: 11,
-                  color: AppColors.error,
-                ),
-              ),
-            ],
-          ),
-        );
-      case _LiveChunkStatus.done:
-        return _FadeInText(text: '${chunk.text} ');
-    }
-  }
-}
-
-class _FadeInText extends StatefulWidget {
-  final String text;
-  const _FadeInText({required this.text});
-
-  @override
-  State<_FadeInText> createState() => _FadeInTextState();
-}
-
-class _FadeInTextState extends State<_FadeInText>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _c;
-
-  @override
-  void initState() {
-    super.initState();
-    _c = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 280),
-    )..forward();
-  }
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return FadeTransition(
-      opacity: _c,
-      child: Text(
-        widget.text,
-        style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-              height: 1.55,
-              color: AppColors.textPrimary,
-            ),
-      ),
-    );
-  }
-}
+// Silence analyzer unused; keep a reference so dart:io import is needed
+// when the file is trimmed.
+// ignore: unused_element
+File _unused(String p) => File(p);

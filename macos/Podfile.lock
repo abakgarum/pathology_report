@@ -12,6 +12,8 @@ PODS:
     - FlutterMacOS
   - record_macos (0.2.0):
     - FlutterMacOS
+  - speech_to_text_macos (0.0.1):
+    - FlutterMacOS
 
 DEPENDENCIES:
   - audio_session (from `Flutter/ephemeral/.symlinks/plugins/audio_session/macos`)
@@ -20,6 +22,7 @@ DEPENDENCIES:
   - just_audio (from `Flutter/ephemeral/.symlinks/plugins/just_audio/darwin`)
   - printing (from `Flutter/ephemeral/.symlinks/plugins/printing/macos`)
   - record_macos (from `Flutter/ephemeral/.symlinks/plugins/record_macos/macos`)
+  - speech_to_text_macos (from `Flutter/ephemeral/.symlinks/plugins/speech_to_text_macos/macos`)
 
 EXTERNAL SOURCES:
   audio_session:
@@ -34,6 +37,8 @@ EXTERNAL SOURCES:
     :path: Flutter/ephemeral/.symlinks/plugins/printing/macos
   record_macos:
     :path: Flutter/ephemeral/.symlinks/plugins/record_macos/macos
+  speech_to_text_macos:
+    :path: Flutter/ephemeral/.symlinks/plugins/speech_to_text_macos/macos
 
 SPEC CHECKSUMS:
   audio_session: eaca2512cf2b39212d724f35d11f46180ad3a33e
@@ -42,6 +47,7 @@ SPEC CHECKSUMS:
   just_audio: 4e391f57b79cad2b0674030a00453ca5ce817eed
   printing: c4cf83c78fd684f9bc318e6aadc18972aa48f617
   record_macos: fcfa993538261e6fdb5b3ce08b82000be6ddec71
+  speech_to_text_macos: cb920dff8288c218a7e8c96c8c931b17e801dae7
 
 PODFILE CHECKSUM: 54d867c82ac51cbd61b565781b9fada492027009
 
