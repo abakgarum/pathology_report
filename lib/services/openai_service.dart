@@ -7,12 +7,33 @@ import 'package:http/http.dart' as http;
 ///   1. Whisper transcription (audio -> text)
 ///   2. Chat completions that turn a raw dictation into a structured
 ///      histopathology report matching the lab template.
+///   3. Parsing an uploaded CAP-style template into a structured Q&A schema.
+///   4. Composing a synoptic report from captured answers + free-form
+///      dictation per the CAP synoptic format ("element: response", one per
+///      line, in a single contiguous block).
 class OpenAIService {
   static String get _apiKey => dotenv.env['OPENAI_API_KEY'] ?? '';
 
   static const String _transcriptionsUrl =
       'https://api.openai.com/v1/audio/transcriptions';
   static const String _chatUrl = 'https://api.openai.com/v1/chat/completions';
+
+  /// Glossary biased into Whisper's `prompt` to lift accuracy for clinical
+  /// terms. Whisper's prompt is capped at 224 tokens — keep this terse.
+  /// Reference: cookbook.openai.com/examples/whisper_prompting_guide
+  static const String medicalGlossary =
+      'Histopathology dictation. Common terms: '
+      'adenocarcinoma, squamous cell carcinoma, lobular, ductal, cribriform, '
+      'micropapillary, tubular, mucinous, metaplastic, sarcomatoid, anaplastic, '
+      'lymphovascular invasion, perineural invasion, extranodal extension, '
+      'immunohistochemistry, IHC, AE1/AE3, CK7, CK20, CK5/6, TTF-1, p63, p40, '
+      'Ki-67, ER, PR, HER2, Gleason 3+4=7, Gleason 4+3=7, Nottingham grade, '
+      'mitotic count, nuclear pleomorphism, glandular differentiation, '
+      'pTNM staging, pT1, pT2, pT3, pT4, pN0, pN1, pN2, pM0, pM1, '
+      'margins uninvolved, margin involved, distance to closest margin, '
+      'high grade dysplasia, low grade dysplasia, atypical hyperplasia, '
+      'DCIS, LCIS, in situ, invasive, well differentiated, '
+      'moderately differentiated, poorly differentiated.';
 
   // ─── 1. Whisper transcription ─────────────────────────────────
 
@@ -37,9 +58,12 @@ class OpenAIService {
     if (language != null && language.isNotEmpty) {
       request.fields['language'] = language;
     }
-    if (prompt != null && prompt.isNotEmpty) {
-      request.fields['prompt'] = prompt;
-    }
+    // Always seed Whisper with the medical glossary; callers can extend it
+    // with question-specific context (e.g. the current template question).
+    final effectivePrompt = (prompt == null || prompt.trim().isEmpty)
+        ? medicalGlossary
+        : '$medicalGlossary $prompt';
+    request.fields['prompt'] = effectivePrompt;
 
     request.files.add(await http.MultipartFile.fromPath('file', filePath));
 
@@ -194,6 +218,245 @@ $rawTranscript
       return (data['choices'][0]['message']['content'] as String).trim();
     }
     throw Exception('OpenAI correction error ${response.statusCode}');
+  }
+
+  // ─── 3. Template parser (CAP-style synoptic Q&A extraction) ───
+
+  /// Parse the plain text content of a CAP-style synoptic protocol into a
+  /// structured Q&A tree. Returns the JSON string the caller decodes into a
+  /// `TemplateSchema`.
+  ///
+  /// The prompt teaches the model the conventions used in CAP Word/PDF
+  /// protocols:
+  ///   - Lines starting with `___` (underscores) are *answer choices*.
+  ///   - Lines starting with `+` are *optional* questions/answers.
+  ///   - Indentation depth encodes branching (DisablesChildren in SDC).
+  ///   - "Note —" lines are narrative guidance; ignore.
+  ///   - Lines ending with `:` and followed by indented `___` lines are
+  ///     *questions*.
+  ///
+  /// Uses a higher reasoning model by default. Caller can override.
+  static Future<String> parseTemplate(
+    String extractedText, {
+    String model = 'gpt-4o',
+  }) async {
+    _requireKey();
+    if (extractedText.trim().isEmpty) {
+      throw Exception('Extracted template text was empty.');
+    }
+
+    const systemPrompt = '''
+You convert CAP-style synoptic pathology protocol documents into a strict
+JSON schema. The input is the plain-text contents of a Word document (CAP
+Cancer Protocol, hospital reporting template, or similar). Output ONLY a
+JSON object — no markdown, no commentary.
+
+Conventions you MUST recognise:
+- Section headers: ALL-CAPS lines or short title lines that group questions.
+- A *question*: a line ending with ":" or that introduces an enumerated set
+  of answers. Often preceded by a number/letter like "1." or "a)".
+- An *answer choice*: a line starting with "___" (underscores), "☐", "[ ]",
+  "o ", "•", or similar bullet markers. May begin with "+ ___" — the "+"
+  marks the entire choice as optional. Strip the marker; keep the label text.
+- *Optional* element: leading "+" before a question or answer means it is
+  optional (not required for synoptic compliance). Set "required": false.
+- *Branching* (CAP DisablesChildren): an answer is a *parent* of any
+  question whose indentation depth is GREATER than the answer's, until
+  indentation returns to the answer's level or shallower. Capture this by
+  setting `triggers_question_ids` on the parent answer to the IDs of its
+  child questions.
+- *Free-text affordances*: an answer like "Other (specify): ___" or
+  "Not specified ___" means the question allows free text alongside the
+  selection. Set `free_text_allowed`: true on the question.
+- *Numeric fields*: questions with units (mm, cm, %, ml, °) or "(specify
+  measurement)" become `"type": "decimal"` (or "integer" if no decimal
+  point is meaningful) and capture the unit string in `units`.
+- *Dates*: "Date of …" with blank or "(specify date)" becomes `"type": "date"`.
+- *Multi-select*: questions with "select all that apply", "check all", or
+  multiple checkboxes with no exclusion become `"type": "multi_select"`.
+- "Note —" / "Comment —" / "Reference —" paragraphs are NARRATIVE; skip.
+
+Output schema (use exactly these keys):
+{
+  "version": "v4.7.0.0 or similar if found, else empty string",
+  "sections": [
+    {
+      "title": "Section title",
+      "questions": [
+        {
+          "id": "q-001",
+          "label": "Question text without trailing colon",
+          "type": "single_select" | "multi_select" | "text" | "integer" | "decimal" | "date",
+          "required": true,
+          "units": "mm",
+          "free_text_allowed": false,
+          "parent_answer_id": "",
+          "answers": [
+            {
+              "id": "a-001",
+              "label": "Answer choice text",
+              "triggers_question_ids": ["q-014", "q-015"],
+              "disables_answer_ids": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+Rules:
+- Generate stable, sequential, unique ids of the form "q-001", "q-002", …
+  for questions and "a-001", "a-002", … for answers.
+- Order questions in document order.
+- For type != "single_select" and != "multi_select", "answers" MUST be [].
+- Strip leading bullet markers ("___", "+", "☐", "[ ]", numbering) from
+  every label.
+- If you cannot determine a value, use the field's empty default
+  (`""`, `[]`, `false`).
+- Return ONLY the JSON object. No explanations.
+''';
+
+    // Truncate generously — gpt-4o handles long context. CAP protocols are
+    // usually <60k chars after .docx text extraction.
+    final clipped = extractedText.length > 80000
+        ? extractedText.substring(0, 80000)
+        : extractedText;
+
+    try {
+      final response = await http
+          .post(
+        Uri.parse(_chatUrl),
+        headers: {
+          'Authorization': 'Bearer $_apiKey',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({
+          'model': model,
+          'temperature': 0.0,
+          'response_format': {'type': 'json_object'},
+          'messages': [
+            {'role': 'system', 'content': systemPrompt},
+            {'role': 'user', 'content': clipped},
+          ],
+        }),
+      )
+          .timeout(const Duration(seconds: 90));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final content =
+            data['choices'][0]['message']['content'] as String? ?? '{}';
+        return _stripCodeFences(content);
+      }
+      throw Exception(
+          'Template parse error ${response.statusCode}: ${response.body}');
+    } catch (e) {
+      if (_isNetworkError(e)) {
+        throw Exception('Network error connecting to OpenAI: $e');
+      }
+      rethrow;
+    }
+  }
+
+  // ─── 4. Synoptic report composer ──────────────────────────────
+
+  /// Compose the synoptic block (one `Element: response` per line) from
+  /// captured answers plus any free-form dictation. Returns a Map with:
+  ///   - `synoptic`: the contiguous synoptic report text (compliance block)
+  ///   - `clinical_information`, `specimen`, `gross_examination`,
+  ///     `microscopy_impression`, `summary`: routed free-form content
+  ///     extracted from the dictation that did NOT fit a discrete answer.
+  static Future<Map<String, String>> composeSynopticReport({
+    required Map<String, dynamic> answers,
+    required Map<String, String> questionLabels,
+    String freeFormDictation = '',
+    String templateName = '',
+    String model = 'gpt-4o-mini',
+  }) async {
+    _requireKey();
+
+    final labeled = <String, dynamic>{};
+    for (final entry in answers.entries) {
+      final label = questionLabels[entry.key] ?? entry.key;
+      labeled[label] = entry.value;
+    }
+
+    const systemPrompt = '''
+You are a histopathology synoptic report composer. You receive:
+  1. A map of {questionLabel: answer} captured during a guided template
+     workflow (CAP-style synoptic protocol).
+  2. Optional free-form dictation the pathologist added alongside the
+     guided answers.
+
+Produce a JSON object with these exact keys:
+
+{
+  "synoptic": "",
+  "clinical_information": "",
+  "specimen": "",
+  "gross_examination": "",
+  "microscopy_impression": "",
+  "summary": ""
+}
+
+Rules:
+- "synoptic" is the contiguous synoptic block required by CoC/CAP. Format:
+    Element: response
+  one element-response pair per line, in the order received. Do NOT
+  reorder, paraphrase, or omit any answer. Skip pairs where the answer is
+  empty/null. Numeric values include their units exactly as captured.
+- The other four section keys ("clinical_information", "specimen",
+  "gross_examination", "microscopy_impression") receive routed FREE-FORM
+  dictation only — never the synoptic answers (which already live in
+  "synoptic"). If no free-form text was dictated for a section, leave it "".
+- "summary" is one short sentence (≤25 words) summarising the diagnosis
+  derived from the captured answers. If insufficient information to
+  summarise, return "".
+- Do NOT invent clinical content. Do NOT add clauses like "features are
+  suggestive of…" unless the pathologist actually said them.
+- Return ONLY the JSON object. No markdown fences, no commentary.
+''';
+
+    final userPayload = jsonEncode({
+      'template_name': templateName,
+      'answers': labeled,
+      'free_form_dictation': freeFormDictation,
+    });
+
+    try {
+      final response = await http.post(
+        Uri.parse(_chatUrl),
+        headers: {
+          'Authorization': 'Bearer $_apiKey',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({
+          'model': model,
+          'temperature': 0.1,
+          'response_format': {'type': 'json_object'},
+          'messages': [
+            {'role': 'system', 'content': systemPrompt},
+            {'role': 'user', 'content': userPayload},
+          ],
+        }),
+      );
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final content =
+            data['choices'][0]['message']['content'] as String? ?? '{}';
+        final cleaned = _stripCodeFences(content);
+        final parsed = jsonDecode(cleaned) as Map<String, dynamic>;
+        return parsed.map((k, v) => MapEntry(k, (v ?? '').toString()));
+      }
+      throw Exception(
+          'Synoptic compose error ${response.statusCode}: ${response.body}');
+    } catch (e) {
+      if (_isNetworkError(e)) {
+        throw Exception('Network error connecting to OpenAI: $e');
+      }
+      rethrow;
+    }
   }
 
   // ─── helpers ──────────────────────────────────────────────────

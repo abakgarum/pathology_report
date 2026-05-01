@@ -1,5 +1,7 @@
+import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:barcode_widget/barcode_widget.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:pdf/pdf.dart';
@@ -8,13 +10,15 @@ import 'package:printing/printing.dart';
 
 import '../models/report_models.dart';
 import '../services/hive_storage_service.dart';
+import '../services/settings_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/audio_player_widget.dart';
 import 'report_edit_screen.dart';
 
 /// Report detail view — renders the stored report exactly in the template
 /// format from the department (Histopathology Report layout) and offers
-/// PDF export / print.
+/// PDF export / print, with QR code (encoding the report's stable UUID)
+/// and a configurable "Powered by" watermark on every PDF page.
 class ReportDetailScreen extends StatefulWidget {
   final PathologyReport report;
   final VoidCallback? onDeleted;
@@ -185,6 +189,10 @@ class _ReportDetailScreenState extends State<ReportDetailScreen> {
     }
   }
 }
+
+/// QR payload — opaque, no PHI ever. Matches the printed PDF.
+String _qrPayloadFor(PathologyReport r) =>
+    'pathlabpro://report/${r.reportUuid}';
 
 // ─── Status bar (chip row + quick edit) ────────────────────────────
 
@@ -405,6 +413,11 @@ class _TemplateView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final fmt = DateFormat('dd-MM-yyyy hh:mm a');
+    final clinicName = SettingsService.getClinicName();
+    final clinicAddr = SettingsService.getClinicAddress();
+    final logoPath = SettingsService.getClinicLogoPath();
+    final hasLogo = logoPath.isNotEmpty && File(logoPath).existsSync();
+    final printBarcode = SettingsService.getPrintLinearBarcode();
     return Container(
       padding: const EdgeInsets.all(28),
       decoration: BoxDecoration(
@@ -415,12 +428,67 @@ class _TemplateView extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Center(
-            child: Text('DEPARTMENT OF LABORATORY MEDICINE',
-                style: TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 0.4)),
+          // Header: logo (if any) + clinic name + QR code stack on the right.
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (hasLogo) ...[
+                SizedBox(
+                  height: 56,
+                  child: Image.file(File(logoPath), fit: BoxFit.contain),
+                ),
+                const SizedBox(width: 16),
+              ],
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    Text(clinicName,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 0.4)),
+                    if (clinicAddr.isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      Text(clinicAddr,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(fontSize: 11)),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(width: 16),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  BarcodeWidget(
+                    barcode: Barcode.qrCode(),
+                    data: _qrPayloadFor(r),
+                    width: 70,
+                    height: 70,
+                    drawText: false,
+                  ),
+                  const SizedBox(height: 4),
+                  Text(r.reportNumber,
+                      style: const TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.4)),
+                  if (printBarcode)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: BarcodeWidget(
+                        barcode: Barcode.code128(),
+                        data: r.reportUuid,
+                        width: 120,
+                        height: 28,
+                        drawText: false,
+                      ),
+                    ),
+                ],
+              ),
+            ],
           ),
           const SizedBox(height: 14),
           _infoGrid(fmt),
@@ -471,9 +539,8 @@ class _TemplateView extends StatelessWidget {
                         fontSize: 13, fontWeight: FontWeight.w700)),
                 Text(r.pathologistRegistration,
                     style: const TextStyle(fontSize: 12)),
-                const Text(
-                    'Consultant & Head - Histopathology & Laboratory Medicine',
-                    style: TextStyle(fontSize: 12)),
+                Text(SettingsService.getPathologistTitle(),
+                    style: const TextStyle(fontSize: 12)),
               ],
             ),
           ),
@@ -511,7 +578,7 @@ class _TemplateView extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              row('Name', r.patientName.isEmpty ? '—' : 'Mr ${r.patientName}'),
+              row('Name', r.patientName.isEmpty ? '—' : r.patientName),
               row('MRN', r.mrn.isEmpty ? r.patientId : r.mrn),
               row('Age', r.patientAge > 0 ? 'Y ${r.patientAge} Y' : '—'),
               row('Ordered by', r.orderedBy.isEmpty ? '—' : r.orderedBy),
@@ -576,11 +643,29 @@ class _TemplateView extends StatelessWidget {
   }
 }
 
-// ─── PDF generation (matches on-screen template) ──────────────
+// ─── PDF generation (matches on-screen template, with QR + watermark) ──────
 
 Future<Uint8List> _buildPdfBytes(PathologyReport r) async {
   final doc = pw.Document();
   final fmt = DateFormat('dd-MM-yyyy hh:mm a');
+
+  final clinicName = SettingsService.getClinicName();
+  final clinicAddr = SettingsService.getClinicAddress();
+  final clinicPhone = SettingsService.getClinicPhone();
+  final clinicEmail = SettingsService.getClinicEmail();
+  final clinicWebsite = SettingsService.getClinicWebsite();
+  final logoPath = SettingsService.getClinicLogoPath();
+  final watermark = SettingsService.getPdfWatermarkText();
+  final printBarcode = SettingsService.getPrintLinearBarcode();
+  final pathologistTitle = SettingsService.getPathologistTitle();
+
+  pw.MemoryImage? logoImage;
+  if (logoPath.isNotEmpty) {
+    final f = File(logoPath);
+    if (await f.exists()) {
+      logoImage = pw.MemoryImage(await f.readAsBytes());
+    }
+  }
 
   pw.Widget row(String l, String v) => pw.Padding(
         padding: const pw.EdgeInsets.symmetric(vertical: 1.5),
@@ -622,17 +707,108 @@ Future<Uint8List> _buildPdfBytes(PathologyReport r) async {
     );
   }
 
-  doc.addPage(
-    pw.MultiPage(
+  // Per-page watermark — drawn behind the report content via PageTheme
+  // background. Skip if the user has cleared the text in Settings.
+  pw.PageTheme pageTheme() {
+    return pw.PageTheme(
       pageFormat: PdfPageFormat.a4,
       margin: const pw.EdgeInsets.all(28),
+      buildBackground: watermark.isEmpty
+          ? null
+          : (ctx) => pw.FullPage(
+                ignoreMargins: true,
+                child: pw.Watermark.text(
+                  watermark,
+                  style: pw.TextStyle(
+                    color: PdfColors.grey300,
+                    fontSize: 60,
+                    fontWeight: pw.FontWeight.bold,
+                  ),
+                ),
+              ),
+    );
+  }
+
+  final clinicContact = [
+    if (clinicPhone.isNotEmpty) clinicPhone,
+    if (clinicEmail.isNotEmpty) clinicEmail,
+    if (clinicWebsite.isNotEmpty) clinicWebsite,
+  ].join(' · ');
+
+  doc.addPage(
+    pw.MultiPage(
+      pageTheme: pageTheme(),
       build: (context) => [
-        pw.Center(
-          child: pw.Text('DEPARTMENT OF LABORATORY MEDICINE',
-              style: pw.TextStyle(
-                  fontSize: 13, fontWeight: pw.FontWeight.bold)),
+        // Header: logo (left) + clinic name (center) + QR stack (right).
+        pw.Row(
+          crossAxisAlignment: pw.CrossAxisAlignment.start,
+          children: [
+            if (logoImage != null) ...[
+              pw.SizedBox(
+                width: 54,
+                height: 54,
+                child: pw.Image(logoImage, fit: pw.BoxFit.contain),
+              ),
+              pw.SizedBox(width: 12),
+            ],
+            pw.Expanded(
+              child: pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.center,
+                children: [
+                  pw.Text(clinicName,
+                      textAlign: pw.TextAlign.center,
+                      style: pw.TextStyle(
+                          fontSize: 13, fontWeight: pw.FontWeight.bold)),
+                  if (clinicAddr.isNotEmpty)
+                    pw.Padding(
+                      padding: const pw.EdgeInsets.only(top: 2),
+                      child: pw.Text(clinicAddr,
+                          textAlign: pw.TextAlign.center,
+                          style: const pw.TextStyle(fontSize: 9)),
+                    ),
+                  if (clinicContact.isNotEmpty)
+                    pw.Padding(
+                      padding: const pw.EdgeInsets.only(top: 2),
+                      child: pw.Text(clinicContact,
+                          textAlign: pw.TextAlign.center,
+                          style: const pw.TextStyle(fontSize: 9)),
+                    ),
+                ],
+              ),
+            ),
+            pw.SizedBox(width: 12),
+            pw.Column(
+              crossAxisAlignment: pw.CrossAxisAlignment.end,
+              children: [
+                pw.BarcodeWidget(
+                  barcode: pw.Barcode.qrCode(),
+                  data: _qrPayloadFor(r),
+                  width: 60,
+                  height: 60,
+                  drawText: false,
+                ),
+                pw.SizedBox(height: 3),
+                pw.Text(r.reportNumber,
+                    style: pw.TextStyle(
+                        fontSize: 9, fontWeight: pw.FontWeight.bold)),
+                if (printBarcode)
+                  pw.Padding(
+                    padding: const pw.EdgeInsets.only(top: 4),
+                    child: pw.BarcodeWidget(
+                      barcode: pw.Barcode.code128(),
+                      data: r.reportUuid,
+                      width: 110,
+                      height: 22,
+                      drawText: false,
+                    ),
+                  ),
+              ],
+            ),
+          ],
         ),
-        pw.SizedBox(height: 10),
+        pw.SizedBox(height: 8),
+        pw.Divider(thickness: 0.6),
+        pw.SizedBox(height: 6),
         pw.Row(
           crossAxisAlignment: pw.CrossAxisAlignment.start,
           children: [
@@ -641,7 +817,7 @@ Future<Uint8List> _buildPdfBytes(PathologyReport r) async {
                 crossAxisAlignment: pw.CrossAxisAlignment.start,
                 children: [
                   row('Name',
-                      r.patientName.isEmpty ? '—' : 'Mr ${r.patientName}'),
+                      r.patientName.isEmpty ? '—' : r.patientName),
                   row('MRN', r.mrn.isEmpty ? r.patientId : r.mrn),
                   row('Age', r.patientAge > 0 ? 'Y ${r.patientAge} Y' : '—'),
                   row('Ordered by', r.orderedBy.isEmpty ? '—' : r.orderedBy),
@@ -727,8 +903,7 @@ Future<Uint8List> _buildPdfBytes(PathologyReport r) async {
                       fontSize: 11, fontWeight: pw.FontWeight.bold)),
               pw.Text(r.pathologistRegistration,
                   style: const pw.TextStyle(fontSize: 10)),
-              pw.Text(
-                  'Consultant & Head - Histopathology & Laboratory Medicine',
+              pw.Text(pathologistTitle,
                   style: const pw.TextStyle(fontSize: 10)),
             ],
           ),

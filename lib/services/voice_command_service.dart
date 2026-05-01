@@ -37,6 +37,13 @@ class VoiceLogLine {
 }
 
 /// Continuous on-device speech recognizer.
+///
+/// On macOS the underlying `SFSpeechRecognizer` finalizes after ~60s of
+/// silence and the audio engine drops out. To keep the live transcript
+/// flowing without a visible seam this service uses a *proactive overlap*:
+/// at the 45s mark we schedule a `_listenOnce()` that re-arms a fresh
+/// recognizer task BEFORE the current one finalizes, so the listening pill
+/// never blinks off.
 class VoiceCommandService {
   VoiceCommandService._();
   static final VoiceCommandService instance = VoiceCommandService._();
@@ -51,6 +58,13 @@ class VoiceCommandService {
   DateTime _lastMatchTime = DateTime.fromMillisecondsSinceEpoch(0);
   String _lastError = '';
   String _lastStatus = '';
+
+  // Proactive-restart window. SFSpeechRecognizer finalizes around 60s of
+  // silence; we re-arm at 45s so the seam is invisible.
+  static const Duration _listenWindow = Duration(seconds: 50);
+  static const Duration _proactiveRefresh = Duration(seconds: 45);
+  Timer? _refreshTimer;
+  DateTime _listenStartedAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   final _commandController = StreamController<VoiceCommandEvent>.broadcast();
   final _transcriptController =
@@ -150,6 +164,7 @@ class VoiceCommandService {
   /// "Retry" button in the UI after the user grants permission.
   Future<bool> reinit() async {
     _log('info', 'reinit() called — tearing down…');
+    _refreshTimer?.cancel();
     try {
       await _stt.stop();
     } catch (_) {}
@@ -205,6 +220,7 @@ class VoiceCommandService {
   Future<void> stop() async {
     _log('info', 'stop() called');
     _shouldListen = false;
+    _refreshTimer?.cancel();
     try {
       await _stt.stop();
     } catch (e) {
@@ -224,6 +240,7 @@ class VoiceCommandService {
     if (!_available) return '';
     final wasListening = _shouldListen;
     _shouldListen = false;
+    _refreshTimer?.cancel();
     try {
       await _stt.stop();
     } catch (_) {}
@@ -239,9 +256,14 @@ class VoiceCommandService {
         },
         listenFor: duration,
         pauseFor: const Duration(seconds: 3),
-        partialResults: true,
         localeId: SettingsService.getLocale(),
-        listenMode: stt.ListenMode.dictation,
+        listenOptions: stt.SpeechListenOptions(
+          partialResults: true,
+          listenMode: stt.ListenMode.dictation,
+          onDevice: Platform.isMacOS || Platform.isIOS,
+          autoPunctuation: true,
+          enableHapticFeedback: false,
+        ),
       );
     } catch (e) {
       _log('error', 'testOnce listen threw: $e');
@@ -261,6 +283,7 @@ class VoiceCommandService {
 
   void dispose() {
     _shouldListen = false;
+    _refreshTimer?.cancel();
     _stt.stop();
     _commandController.close();
     _transcriptController.close();
@@ -275,26 +298,41 @@ class VoiceCommandService {
       _log('warn', '_listenOnce: not available, skipping');
       return;
     }
-    if (_currentlyListening) {
-      _log('info', '_listenOnce: already listening, skipping');
-      return;
-    }
     if (!_shouldListen) {
       _log('info', '_listenOnce: shouldListen=false, skipping');
       return;
     }
+    // If already listening AND we're inside the proactive-refresh window,
+    // cycle the recognizer to re-arm a fresh task before the OS finalizes
+    // the current one. This is what gives "smooth" continuous transcription.
+    if (_currentlyListening) {
+      try {
+        await _stt.stop();
+      } catch (_) {}
+      _currentlyListening = false;
+    }
+
     try {
       _log('info',
           '_listenOnce: calling stt.listen(locale=${SettingsService.getLocale()})');
       await _stt.listen(
         onResult: _onResult,
-        listenFor: const Duration(minutes: 5),
+        listenFor: _listenWindow,
         pauseFor: const Duration(seconds: 10),
-        partialResults: true,
         localeId: SettingsService.getLocale(),
-        listenMode: stt.ListenMode.dictation,
+        listenOptions: stt.SpeechListenOptions(
+          partialResults: true,
+          listenMode: stt.ListenMode.dictation,
+          // onDevice forces the local model on macOS / iOS — no network
+          // round-trip per partial, removes most of the visible stutter.
+          onDevice: Platform.isMacOS || Platform.isIOS,
+          autoPunctuation: true,
+          enableHapticFeedback: false,
+        ),
       );
       _currentlyListening = true;
+      _listenStartedAt = DateTime.now();
+      _scheduleProactiveRefresh();
       _log('info', 'stt.listen() succeeded — now listening');
     } catch (e, st) {
       _log('error', '_listenOnce threw: $e\n$st');
@@ -303,9 +341,21 @@ class VoiceCommandService {
     }
   }
 
+  void _scheduleProactiveRefresh() {
+    _refreshTimer?.cancel();
+    _refreshTimer = Timer(_proactiveRefresh, () async {
+      if (!_shouldListen) return;
+      final age = DateTime.now().difference(_listenStartedAt);
+      if (age < _proactiveRefresh) return;
+      _log('info',
+          'proactive refresh (age=${age.inSeconds}s) — cycling recognizer');
+      await _listenOnce();
+    });
+  }
+
   void _restartIfNeeded() {
     if (!_shouldListen) return;
-    Future.delayed(const Duration(milliseconds: 400), _listenOnce);
+    Future.delayed(const Duration(milliseconds: 200), _listenOnce);
   }
 
   void _onResult(SpeechRecognitionResult r) {
@@ -403,6 +453,11 @@ class VoiceCommandService {
     return text.substring(0, cut).trim();
   }
 
+  /// Normalize a spoken number/id phrase into a compact identifier. Public
+  /// so callers (e.g. the guided wizard for integer/decimal answers) can
+  /// reuse the same digit/word mapping.
+  static String normalizeSpokenId(String input) => _normalizePatientId(input);
+
   static String _normalizePatientId(String input) {
     const numberWords = {
       'zero': '0',
@@ -422,10 +477,12 @@ class VoiceCommandService {
       'dash': '-',
       'hyphen': '-',
       'slash': '/',
+      'point': '.',
+      'dot': '.',
     };
     final out = StringBuffer();
     for (final raw in input.toLowerCase().split(RegExp(r'\s+'))) {
-      final word = raw.replaceAll(RegExp(r'[^a-z0-9\-/]'), '');
+      final word = raw.replaceAll(RegExp(r'[^a-z0-9\-/.]'), '');
       if (word.isEmpty) continue;
       if (numberWords.containsKey(word)) {
         out.write(numberWords[word]);

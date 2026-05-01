@@ -23,6 +23,7 @@ class HiveStorageService {
   static const String reportsBox = 'reports';
   static const String draftsBox = 'drafts';
   static const String templatesBox = 'template_files';
+  static const String templateSchemasBox = 'template_schemas';
 
   static bool _initialized = false;
 
@@ -35,11 +36,17 @@ class HiveStorageService {
     Hive.registerAdapter(ReportStatusAdapter());
     Hive.registerAdapter(PathologyReportAdapter());
     Hive.registerAdapter(TemplateDocumentAdapter());
+    Hive.registerAdapter(TemplateQuestionTypeAdapter());
+    Hive.registerAdapter(TemplateAnswerAdapter());
+    Hive.registerAdapter(TemplateQuestionAdapter());
+    Hive.registerAdapter(TemplateSectionAdapter());
+    Hive.registerAdapter(TemplateSchemaAdapter());
 
     await Hive.openBox<Patient>(patientsBox);
     await Hive.openBox<PathologyReport>(reportsBox);
     await Hive.openBox(draftsBox); // dynamic map
     await Hive.openBox<TemplateDocument>(templatesBox);
+    await Hive.openBox<TemplateSchema>(templateSchemasBox);
 
     _initialized = true;
   }
@@ -163,6 +170,9 @@ class HiveStorageService {
       } catch (_) {}
     }
     await _templates.delete(id);
+    // Drop the parsed schema too — keeping it without the source file
+    // would leave the guided flow pointing at a missing template.
+    await deleteTemplateSchema(id);
   }
 
   /// Copy an uploaded template file into the app's documents directory and
@@ -183,6 +193,23 @@ class HiveStorageService {
 
   static ValueListenable<Box<TemplateDocument>> templatesListenable() =>
       _templates.listenable();
+
+  // ─── Template schema (parsed Q&A tree) ─────────────────────────
+
+  static Box<TemplateSchema> get _schemas =>
+      Hive.box<TemplateSchema>(templateSchemasBox);
+
+  static TemplateSchema? getTemplateSchema(String templateId) =>
+      _schemas.get(templateId);
+
+  static Future<void> saveTemplateSchema(TemplateSchema schema) =>
+      _schemas.put(schema.templateId, schema);
+
+  static Future<void> deleteTemplateSchema(String templateId) =>
+      _schemas.delete(templateId);
+
+  static ValueListenable<Box<TemplateSchema>> schemasListenable() =>
+      _schemas.listenable();
 
   // ─── Audio file storage ────────────────────────────────────────
 

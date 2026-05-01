@@ -4,10 +4,11 @@ import 'package:hive_flutter/hive_flutter.dart';
 /// Voice commands the app listens for. Each has a configurable phrase
 /// (what the doctor actually says) stored in a Hive settings box.
 ///
-/// Commands fall into three groups:
+/// Commands fall into four groups:
 ///   - Navigation:  dashboard, newReport, openReports, openSettings, back
 ///   - Recording:   start, pause, resume, stop
 ///   - Report:      generate, save, discard, patientId, confirm, cancel
+///   - Wizard:      next, previous, skip (used by the guided template flow)
 enum VoiceCommand {
   // Navigation
   dashboard,
@@ -27,6 +28,10 @@ enum VoiceCommand {
   patientId,
   confirm,
   cancel,
+  // Guided wizard
+  next,
+  previous,
+  skip,
 }
 
 extension VoiceCommandKey on VoiceCommand {
@@ -64,6 +69,12 @@ extension VoiceCommandKey on VoiceCommand {
         return 'Confirm / Yes';
       case VoiceCommand.cancel:
         return 'Cancel / No';
+      case VoiceCommand.next:
+        return 'Next Question';
+      case VoiceCommand.previous:
+        return 'Previous Question';
+      case VoiceCommand.skip:
+        return 'Skip Question';
     }
   }
 }
@@ -74,7 +85,18 @@ class SettingsService {
   static const String _localeKey = 'speech_locale';
   static const String _pathologistNameKey = 'pathologist_name';
   static const String _pathologistRegKey = 'pathologist_registration';
+  static const String _pathologistTitleKey = 'pathologist_title';
   static const String _activeTemplateIdKey = 'active_template_id';
+
+  // Branding
+  static const String _clinicNameKey = 'clinic_name';
+  static const String _clinicAddressKey = 'clinic_address';
+  static const String _clinicPhoneKey = 'clinic_phone';
+  static const String _clinicEmailKey = 'clinic_email';
+  static const String _clinicWebsiteKey = 'clinic_website';
+  static const String _clinicLogoPathKey = 'clinic_logo_path';
+  static const String _watermarkTextKey = 'pdf_watermark_text';
+  static const String _printLinearBarcodeKey = 'print_linear_barcode';
 
   static Box get _box => Hive.box(_boxName);
 
@@ -82,6 +104,25 @@ class SettingsService {
     await Hive.openBox(_boxName);
     if (_box.get(_commandsKey) == null) {
       await _box.put(_commandsKey, defaults());
+    } else {
+      // Merge in any commands that did not exist when the user's settings were
+      // first written (so upgrades pick up `next` / `previous` / `skip`
+      // automatically without resetting custom phrases).
+      final stored = Map<String, String>.from(
+        (_box.get(_commandsKey) as Map).map(
+          (k, v) => MapEntry(k.toString(), v.toString()),
+        ),
+      );
+      var changed = false;
+      for (final entry in defaults().entries) {
+        if (!stored.containsKey(entry.key)) {
+          stored[entry.key] = entry.value;
+          changed = true;
+        }
+      }
+      if (changed) {
+        await _box.put(_commandsKey, stored);
+      }
     }
   }
 
@@ -103,6 +144,9 @@ class SettingsService {
         VoiceCommand.patientId.key: 'patient id is|patient id',
         VoiceCommand.confirm.key: 'confirm|yes|correct',
         VoiceCommand.cancel.key: 'cancel|no',
+        VoiceCommand.next.key: 'next|next question|move on',
+        VoiceCommand.previous.key: 'previous|go back one|previous question',
+        VoiceCommand.skip.key: 'skip|skip this|leave blank',
       };
 
   static Map<String, String> getPhrases() {
@@ -130,13 +174,24 @@ class SettingsService {
 
   static String getPathologistName() => _box.get(_pathologistNameKey,
       defaultValue: 'Dr. Komal D. Chippalkatti');
-  static Future<void> setPathologistName(String v) =>
-      _box.put(_pathologistNameKey, v);
+  static Future<void> setPathologistName(String v) async {
+    await _box.put(_pathologistNameKey, v);
+    _notifier.value++;
+  }
 
   static String getPathologistRegistration() =>
       _box.get(_pathologistRegKey, defaultValue: 'KMC - 79367');
-  static Future<void> setPathologistRegistration(String v) =>
-      _box.put(_pathologistRegKey, v);
+  static Future<void> setPathologistRegistration(String v) async {
+    await _box.put(_pathologistRegKey, v);
+    _notifier.value++;
+  }
+
+  static String getPathologistTitle() => _box.get(_pathologistTitleKey,
+      defaultValue: 'Consultant & Head - Histopathology & Laboratory Medicine');
+  static Future<void> setPathologistTitle(String v) async {
+    await _box.put(_pathologistTitleKey, v);
+    _notifier.value++;
+  }
 
   /// Active report template id. Empty string means "no template" — the
   /// generator will fall back to its internal structure.
@@ -144,6 +199,66 @@ class SettingsService {
       _box.get(_activeTemplateIdKey, defaultValue: '');
   static Future<void> setActiveTemplateId(String v) async {
     await _box.put(_activeTemplateIdKey, v);
+    _notifier.value++;
+  }
+
+  // ─── Branding ────────────────────────────────────────────────────────
+
+  static String getClinicName() => _box.get(_clinicNameKey,
+      defaultValue: 'DEPARTMENT OF LABORATORY MEDICINE');
+  static Future<void> setClinicName(String v) async {
+    await _box.put(_clinicNameKey, v);
+    _notifier.value++;
+  }
+
+  static String getClinicAddress() =>
+      _box.get(_clinicAddressKey, defaultValue: '');
+  static Future<void> setClinicAddress(String v) async {
+    await _box.put(_clinicAddressKey, v);
+    _notifier.value++;
+  }
+
+  static String getClinicPhone() =>
+      _box.get(_clinicPhoneKey, defaultValue: '');
+  static Future<void> setClinicPhone(String v) async {
+    await _box.put(_clinicPhoneKey, v);
+    _notifier.value++;
+  }
+
+  static String getClinicEmail() =>
+      _box.get(_clinicEmailKey, defaultValue: '');
+  static Future<void> setClinicEmail(String v) async {
+    await _box.put(_clinicEmailKey, v);
+    _notifier.value++;
+  }
+
+  static String getClinicWebsite() =>
+      _box.get(_clinicWebsiteKey, defaultValue: '');
+  static Future<void> setClinicWebsite(String v) async {
+    await _box.put(_clinicWebsiteKey, v);
+    _notifier.value++;
+  }
+
+  /// Absolute path to the user-uploaded logo PNG (under app support dir).
+  /// Empty string means "no logo configured".
+  static String getClinicLogoPath() =>
+      _box.get(_clinicLogoPathKey, defaultValue: '');
+  static Future<void> setClinicLogoPath(String v) async {
+    await _box.put(_clinicLogoPathKey, v);
+    _notifier.value++;
+  }
+
+  static String getPdfWatermarkText() => _box.get(_watermarkTextKey,
+      defaultValue: 'Powered by PathLab Pro');
+  static Future<void> setPdfWatermarkText(String v) async {
+    await _box.put(_watermarkTextKey, v);
+    _notifier.value++;
+  }
+
+  static bool getPrintLinearBarcode() =>
+      _box.get(_printLinearBarcodeKey, defaultValue: false);
+  static Future<void> setPrintLinearBarcode(bool v) async {
+    await _box.put(_printLinearBarcodeKey, v);
     _notifier.value++;
   }
 

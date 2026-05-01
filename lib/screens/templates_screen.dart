@@ -8,11 +8,13 @@ import 'package:path/path.dart' as p;
 import '../models/report_models.dart';
 import '../services/hive_storage_service.dart';
 import '../services/settings_service.dart';
+import '../services/template_parser_service.dart';
 import '../theme/app_theme.dart';
 
 /// Manage report template files. Each template is backed by an uploaded
-/// document (e.g. a CAP protocol `.docx`) — no custom text editor. The file
-/// is copied into the app's documents directory on upload.
+/// document (e.g. a CAP protocol `.docx`). On upload the file is copied
+/// into the app's documents directory AND the contents are parsed by the
+/// LLM into a structured Q&A schema that drives the guided wizard.
 class TemplatesScreen extends StatefulWidget {
   final VoidCallback? onBack;
   const TemplatesScreen({super.key, this.onBack});
@@ -23,6 +25,8 @@ class TemplatesScreen extends StatefulWidget {
 
 class _TemplatesScreenState extends State<TemplatesScreen> {
   String? _selectedId;
+  final Set<String> _parsing = <String>{};
+  final Map<String, String> _parseErrors = <String, String>{};
 
   @override
   Widget build(BuildContext context) {
@@ -32,6 +36,7 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
         child: Column(
           children: [
             _topBar(),
+            _licensingNotice(),
             Expanded(
               child: ValueListenableBuilder(
                 valueListenable: HiveStorageService.templatesListenable(),
@@ -92,7 +97,7 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
           const SizedBox(width: 12),
           Expanded(
             child: Text(
-              'Upload CAP templates (.docx / .doc / .pdf / .txt) — the file itself is stored.',
+              'Upload a .docx — the file is parsed into a guided Q&A wizard.',
               style: Theme.of(context).textTheme.bodySmall,
               overflow: TextOverflow.ellipsis,
             ),
@@ -101,6 +106,33 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
             onPressed: () => _openUploadDialog(),
             icon: const Icon(Icons.upload_file_rounded, size: 18),
             label: const Text('Upload template'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _licensingNotice() {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: AppColors.warning.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.warning.withOpacity(0.4)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.gavel_rounded,
+              size: 16, color: AppColors.warning),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'CAP cancer protocols are copyrighted. You are responsible for '
+              'ensuring you have a valid CAP license for any CAP protocol '
+              'files you upload — this app does not ship CAP content.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
           ),
         ],
       ),
@@ -119,7 +151,7 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
               style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 6),
           Text(
-              'Download a CAP protocol from cap.org and upload the .docx file here.',
+              'Upload a .docx — the wizard will guide each report through it.',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.bodySmall),
           const SizedBox(height: 16),
@@ -135,79 +167,149 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
 
   Widget _list(
       List<TemplateDocument> templates, String activeId, String currentId) {
-    return ListView.separated(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      itemCount: templates.length,
-      separatorBuilder: (_, __) =>
-          const Divider(height: 1, color: AppColors.divider),
-      itemBuilder: (context, i) {
-        final t = templates[i];
-        final isActive = t.id == activeId;
-        final isSelected = t.id == currentId;
-        return Material(
-          color: isSelected
-              ? AppColors.primary.withOpacity(0.06)
-              : Colors.transparent,
-          child: InkWell(
-            onTap: () => setState(() => _selectedId = t.id),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(
-                  horizontal: 16, vertical: 12),
-              child: Row(
-                children: [
-                  Icon(
-                    isActive
-                        ? Icons.star_rounded
-                        : _iconForExt(t.sourceFileName),
-                    size: 18,
-                    color: isActive
-                        ? AppColors.warning
-                        : AppColors.textSecondary,
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          t.name.isEmpty ? 'Untitled template' : t.name,
-                          style: const TextStyle(
-                              fontSize: 14, fontWeight: FontWeight.w600),
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        if (t.label.isNotEmpty) ...[
-                          const SizedBox(height: 3),
-                          _labelChip(t.label),
-                        ],
-                        const SizedBox(height: 3),
-                        Text(
-                          '${_fmtSize(t.fileSize)} · updated ${DateFormat('dd MMM yyyy').format(t.updatedAt)}',
-                          style: Theme.of(context).textTheme.bodySmall,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (isActive)
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: AppColors.warning.withOpacity(0.12),
-                        borderRadius: BorderRadius.circular(10),
+    return ValueListenableBuilder(
+      valueListenable: HiveStorageService.schemasListenable(),
+      builder: (_, __, ___) {
+        return ListView.separated(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          itemCount: templates.length,
+          separatorBuilder: (_, __) =>
+              const Divider(height: 1, color: AppColors.divider),
+          itemBuilder: (context, i) {
+            final t = templates[i];
+            final isActive = t.id == activeId;
+            final isSelected = t.id == currentId;
+            final schema = HiveStorageService.getTemplateSchema(t.id);
+            final parsing = _parsing.contains(t.id);
+            return Material(
+              color: isSelected
+                  ? AppColors.primary.withOpacity(0.06)
+                  : Colors.transparent,
+              child: InkWell(
+                onTap: () => setState(() => _selectedId = t.id),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 16, vertical: 12),
+                  child: Row(
+                    children: [
+                      Icon(
+                        isActive
+                            ? Icons.star_rounded
+                            : _iconForExt(t.sourceFileName),
+                        size: 18,
+                        color: isActive
+                            ? AppColors.warning
+                            : AppColors.textSecondary,
                       ),
-                      child: const Text('Default',
-                          style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.w700,
-                              color: AppColors.warning)),
-                    ),
-                ],
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              t.name.isEmpty ? 'Untitled template' : t.name,
+                              style: const TextStyle(
+                                  fontSize: 14, fontWeight: FontWeight.w600),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            if (t.label.isNotEmpty) ...[
+                              const SizedBox(height: 3),
+                              _labelChip(t.label),
+                            ],
+                            const SizedBox(height: 4),
+                            _parsedStatusChip(t, schema, parsing),
+                          ],
+                        ),
+                      ),
+                      if (isActive)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: AppColors.warning.withOpacity(0.12),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: const Text('Default',
+                              style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w700,
+                                  color: AppColors.warning)),
+                        ),
+                    ],
+                  ),
+                ),
               ),
-            ),
-          ),
+            );
+          },
         );
       },
+    );
+  }
+
+  Widget _parsedStatusChip(
+      TemplateDocument t, TemplateSchema? schema, bool parsing) {
+    if (parsing) {
+      return _statusChip(
+        'Parsing…',
+        const Color(0xFF3182CE),
+        leading: const SizedBox(
+          width: 10,
+          height: 10,
+          child: CircularProgressIndicator(strokeWidth: 1.6),
+        ),
+      );
+    }
+    if (schema != null) {
+      final secs = schema.sections.length;
+      final qs = schema.totalQuestions;
+      return _statusChip(
+        'Parsed · $secs sec · $qs Q',
+        AppColors.success,
+        leading: const Icon(Icons.check_circle_rounded,
+            size: 11, color: AppColors.success),
+      );
+    }
+    final err = _parseErrors[t.id];
+    if (err != null) {
+      return _statusChip(
+        'Parse failed — tap Re-parse',
+        AppColors.error,
+        leading: const Icon(Icons.error_outline_rounded,
+            size: 11, color: AppColors.error),
+      );
+    }
+    return _statusChip(
+      'Free-form (not parsed)',
+      AppColors.textHint,
+      leading: const Icon(Icons.subject_rounded,
+          size: 11, color: AppColors.textHint),
+    );
+  }
+
+  Widget _statusChip(String label, Color color, {Widget? leading}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.10),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (leading != null) leading,
+          if (leading != null) const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              label,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  color: color),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -262,6 +364,8 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
   Widget _preview(TemplateDocument t, String activeId) {
     final isActive = t.id == activeId;
     final fmt = DateFormat('dd MMM yyyy · HH:mm');
+    final schema = HiveStorageService.getTemplateSchema(t.id);
+    final parsing = _parsing.contains(t.id);
     return Padding(
       padding: const EdgeInsets.all(20),
       child: Column(
@@ -285,6 +389,12 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
                 ),
               ),
               const SizedBox(width: 12),
+              OutlinedButton.icon(
+                onPressed: parsing ? null : () => _reparse(t),
+                icon: const Icon(Icons.auto_fix_high_rounded, size: 18),
+                label: Text(schema == null ? 'Parse' : 'Re-parse'),
+              ),
+              const SizedBox(width: 8),
               OutlinedButton.icon(
                 onPressed: () => _setActive(t.id, !isActive),
                 icon: Icon(
@@ -315,61 +425,237 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
           const SizedBox(height: 10),
           _metaRow(t, fmt),
           const SizedBox(height: 16),
-          Expanded(
-            child: Container(
-              padding: const EdgeInsets.all(20),
-              decoration: BoxDecoration(
-                color: AppColors.surface,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: AppColors.border),
-              ),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(_iconForExt(t.sourceFileName),
-                      size: 56, color: AppColors.primary),
-                  const SizedBox(height: 12),
-                  Text(
-                    t.sourceFileName.isEmpty ? 'File' : t.sourceFileName,
-                    style: Theme.of(context).textTheme.titleMedium,
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 4),
-                  Text(_fmtSize(t.fileSize),
-                      style: Theme.of(context).textTheme.bodySmall),
-                  const SizedBox(height: 4),
-                  SelectableText(
-                    t.filePath,
-                    style: const TextStyle(
-                        fontSize: 11,
-                        color: AppColors.textHint,
-                        fontFamily: 'monospace'),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 16),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    alignment: WrapAlignment.center,
-                    children: [
-                      OutlinedButton.icon(
-                        onPressed: () => _revealInFinder(t),
-                        icon: const Icon(Icons.folder_open_rounded, size: 16),
-                        label: const Text('Reveal in Finder'),
-                      ),
-                      OutlinedButton.icon(
-                        onPressed: () => _replaceFile(t),
-                        icon: const Icon(Icons.refresh_rounded, size: 16),
-                        label: const Text('Replace file'),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ),
+          Expanded(child: _previewBody(t, schema, parsing)),
         ],
       ),
+    );
+  }
+
+  Widget _previewBody(
+      TemplateDocument t, TemplateSchema? schema, bool parsing) {
+    if (parsing) {
+      return Container(
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: AppColors.surface,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: AppColors.border),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: const [
+            SizedBox(
+                width: 28,
+                height: 28,
+                child: CircularProgressIndicator(strokeWidth: 2.4)),
+            SizedBox(height: 12),
+            Text('Parsing template — usually 5-15 seconds…',
+                style: TextStyle(fontSize: 12, color: AppColors.textHint)),
+          ],
+        ),
+      );
+    }
+    if (schema == null) {
+      final err = _parseErrors[t.id];
+      return Container(
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: AppColors.surface,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: AppColors.border),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(_iconForExt(t.sourceFileName),
+                size: 56, color: AppColors.primary),
+            const SizedBox(height: 12),
+            Text(
+              t.sourceFileName.isEmpty ? 'File' : t.sourceFileName,
+              style: Theme.of(context).textTheme.titleMedium,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 4),
+            Text(_fmtSize(t.fileSize),
+                style: Theme.of(context).textTheme.bodySmall),
+            const SizedBox(height: 12),
+            if (err != null) ...[
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: AppColors.error.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text('Last parse error: $err',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                        fontSize: 12, color: AppColors.error)),
+              ),
+              const SizedBox(height: 12),
+            ] else ...[
+              const Text(
+                'Not parsed yet — guided mode unavailable for this template. '
+                'Reports will fall back to free-form dictation.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, color: AppColors.textHint),
+              ),
+              const SizedBox(height: 12),
+            ],
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              alignment: WrapAlignment.center,
+              children: [
+                FilledButton.icon(
+                  onPressed: () => _reparse(t),
+                  icon: const Icon(Icons.auto_fix_high_rounded, size: 16),
+                  label: const Text('Parse now'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () => _revealInFinder(t),
+                  icon: const Icon(Icons.folder_open_rounded, size: 16),
+                  label: const Text('Reveal in Finder'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () => _replaceFile(t),
+                  icon: const Icon(Icons.refresh_rounded, size: 16),
+                  label: const Text('Replace file'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      );
+    }
+    return _schemaBrowser(schema);
+  }
+
+  Widget _schemaBrowser(TemplateSchema schema) {
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.border),
+      ),
+      padding: const EdgeInsets.all(8),
+      child: ListView.builder(
+        itemCount: schema.sections.length,
+        itemBuilder: (_, i) {
+          final s = schema.sections[i];
+          return ExpansionTile(
+            tilePadding: const EdgeInsets.symmetric(horizontal: 12),
+            title: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    s.title.isEmpty ? 'Section ${i + 1}' : s.title,
+                    style: const TextStyle(
+                        fontSize: 13, fontWeight: FontWeight.w700),
+                  ),
+                ),
+                Text('${s.questions.length} Q',
+                    style: const TextStyle(
+                        fontSize: 11, color: AppColors.textHint)),
+              ],
+            ),
+            childrenPadding:
+                const EdgeInsets.fromLTRB(12, 0, 12, 8),
+            children: s.questions.map(_questionTile).toList(),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _questionTile(TemplateQuestion q) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: AppColors.surfaceVariant,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    q.label,
+                    style: const TextStyle(
+                        fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
+                ),
+                if (!q.required)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 6, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: AppColors.textHint.withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: const Text('optional',
+                        style: TextStyle(
+                            fontSize: 9,
+                            fontWeight: FontWeight.w700,
+                            color: AppColors.textHint)),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Wrap(
+              spacing: 4,
+              runSpacing: 4,
+              children: [
+                _qMetaChip(q.type.label),
+                if (q.units.isNotEmpty) _qMetaChip('units: ${q.units}'),
+                if (q.freeTextAllowed) _qMetaChip('+ free text'),
+              ],
+            ),
+            if (q.answers.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              ...q.answers.map((a) => Padding(
+                    padding:
+                        const EdgeInsets.only(left: 8, top: 2, bottom: 2),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('• ',
+                            style: TextStyle(
+                                fontSize: 11, color: AppColors.textHint)),
+                        Expanded(
+                          child: Text(
+                            '${a.label}${a.triggersQuestionIds.isNotEmpty ? "  →  ${a.triggersQuestionIds.length} sub-question(s)" : ""}',
+                            style: const TextStyle(
+                                fontSize: 11,
+                                color: AppColors.textSecondary),
+                          ),
+                        ),
+                      ],
+                    ),
+                  )),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _qMetaChip(String s) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(
+        color: AppColors.primary.withOpacity(0.10),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(s,
+          style: const TextStyle(
+              fontSize: 9,
+              fontWeight: FontWeight.w700,
+              color: AppColors.primary)),
     );
   }
 
@@ -453,8 +739,11 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
       fileSize: size,
     );
     await HiveStorageService.saveTemplate(updated);
+    // The schema is now stale — drop it and re-parse.
+    await HiveStorageService.deleteTemplateSchema(t.id);
     if (!mounted) return;
     setState(() {});
+    _runParse(updated);
   }
 
   Future<void> _openUploadDialog() async {
@@ -492,6 +781,8 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
     );
     await HiveStorageService.saveTemplate(template);
     if (mounted) setState(() => _selectedId = template.id);
+    // Auto-parse on upload.
+    _runParse(template);
   }
 
   Future<void> _editMetadata(TemplateDocument t) async {
@@ -511,8 +802,7 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
 
   Future<XFile?> _pickTemplateFile() async {
     const groups = [
-      XTypeGroup(label: 'Word document', extensions: ['docx', 'doc']),
-      XTypeGroup(label: 'PDF', extensions: ['pdf']),
+      XTypeGroup(label: 'Word document', extensions: ['docx']),
       XTypeGroup(label: 'Text', extensions: ['txt', 'rtf']),
     ];
     try {
@@ -528,6 +818,46 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
         );
       }
       return null;
+    }
+  }
+
+  Future<void> _reparse(TemplateDocument t) async {
+    await HiveStorageService.deleteTemplateSchema(t.id);
+    await _runParse(t);
+  }
+
+  Future<void> _runParse(TemplateDocument t) async {
+    if (_parsing.contains(t.id)) return;
+    setState(() {
+      _parsing.add(t.id);
+      _parseErrors.remove(t.id);
+    });
+    try {
+      final schema = await TemplateParserService.parseFile(
+        filePath: t.filePath,
+        templateId: t.id,
+      );
+      await HiveStorageService.saveTemplateSchema(schema);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+              'Parsed: ${schema.sections.length} sections · ${schema.totalQuestions} questions'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } catch (e) {
+      _parseErrors[t.id] = e.toString();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Parse failed — $e'),
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: AppColors.error,
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _parsing.remove(t.id));
     }
   }
 

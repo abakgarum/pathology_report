@@ -2,10 +2,13 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../services/hive_storage_service.dart';
 import '../services/settings_service.dart';
 import '../services/voice_command_service.dart';
 import '../theme/app_theme.dart';
+import 'analytics_screen.dart';
 import 'guide_screen.dart';
+import 'guided_report_screen.dart';
 import 'home_voice_screen.dart';
 import 'reports_list_screen.dart';
 import 'templates_screen.dart';
@@ -21,7 +24,15 @@ class DesktopShell extends StatefulWidget {
   State<DesktopShell> createState() => _DesktopShellState();
 }
 
-enum _Tab { home, newReport, reports, templates, guide, settings }
+enum _Tab {
+  home,
+  newReport,
+  reports,
+  analytics,
+  templates,
+  guide,
+  settings,
+}
 
 class _DesktopShellState extends State<DesktopShell> {
   _Tab _tab = _Tab.home;
@@ -33,11 +44,16 @@ class _DesktopShellState extends State<DesktopShell> {
     super.initState();
     _initVoice();
     _sub = _voice.commands.listen(_onGlobalCommand);
+    SettingsService.changes.addListener(_onSettingsChanged);
   }
 
   Future<void> _initVoice() async {
     final ok = await _voice.init();
     if (ok) await _voice.start();
+  }
+
+  void _onSettingsChanged() {
+    if (mounted) setState(() {});
   }
 
   void _onGlobalCommand(VoiceCommandEvent e) {
@@ -71,6 +87,7 @@ class _DesktopShellState extends State<DesktopShell> {
   @override
   void dispose() {
     _sub?.cancel();
+    SettingsService.changes.removeListener(_onSettingsChanged);
     super.dispose();
   }
 
@@ -109,12 +126,11 @@ class _DesktopShellState extends State<DesktopShell> {
           onOpenSettings: () => _goTo(_Tab.settings),
         );
       case _Tab.newReport:
-        return VoiceReportScreen(
-          onBack: () => _goTo(_Tab.home),
-          onReportSaved: (_) => _goTo(_Tab.reports),
-        );
+        return _routeNewReport();
       case _Tab.reports:
         return const ReportsListScreen();
+      case _Tab.analytics:
+        return AnalyticsScreen(onBack: () => _goTo(_Tab.home));
       case _Tab.templates:
         return TemplatesScreen(onBack: () => _goTo(_Tab.home));
       case _Tab.guide:
@@ -124,19 +140,58 @@ class _DesktopShellState extends State<DesktopShell> {
     }
   }
 
+  /// Decide between the guided wizard and the legacy free-form screen.
+  /// The wizard is only used when an active template exists *and* it has
+  /// been parsed into a schema. Otherwise the lab gets the original
+  /// dictation-only experience — no functionality regression.
+  Widget _routeNewReport() {
+    final activeId = SettingsService.getActiveTemplateId();
+    if (activeId.isNotEmpty) {
+      final template = HiveStorageService.getTemplate(activeId);
+      final schema = HiveStorageService.getTemplateSchema(activeId);
+      if (template != null && schema != null && schema.totalQuestions > 0) {
+        return GuidedReportScreen(
+          template: template,
+          schema: schema,
+          onBack: () => _goTo(_Tab.home),
+          onReportSaved: (_) => _goTo(_Tab.reports),
+        );
+      }
+    }
+    return VoiceReportScreen(
+      onBack: () => _goTo(_Tab.home),
+      onReportSaved: (_) => _goTo(_Tab.reports),
+    );
+  }
+
   // ─── Sidebar (desktop) ──────────────────────────────────
 
   Widget _sidebar() {
+    final activeId = SettingsService.getActiveTemplateId();
+    final hasActiveSchema = activeId.isNotEmpty &&
+        HiveStorageService.getTemplateSchema(activeId) != null;
     return Container(
       width: 240,
       color: AppColors.surface,
       child: Column(
         children: [
           _brand(),
-          _navTile(_Tab.home, Icons.dashboard_rounded, 'Home'),
-          _navTile(_Tab.newReport, Icons.mic_rounded, 'New Voice Report'),
+          _navTile(
+            _Tab.home,
+            Icons.dashboard_rounded,
+            'Home',
+          ),
+          _navTile(
+            _Tab.newReport,
+            Icons.mic_rounded,
+            'New Voice Report',
+            badge: hasActiveSchema ? 'Guided' : null,
+          ),
           _navTile(_Tab.reports, Icons.folder_rounded, 'Reports'),
-          _navTile(_Tab.templates, Icons.description_rounded, 'Templates'),
+          _navTile(
+              _Tab.analytics, Icons.insights_rounded, 'Analytics'),
+          _navTile(
+              _Tab.templates, Icons.description_rounded, 'Templates'),
           _navTile(_Tab.guide, Icons.menu_book_rounded, 'Guide'),
           _navTile(_Tab.settings, Icons.settings_rounded, 'Settings'),
           const Spacer(),
@@ -177,7 +232,7 @@ class _DesktopShellState extends State<DesktopShell> {
     );
   }
 
-  Widget _navTile(_Tab tab, IconData icon, String label) {
+  Widget _navTile(_Tab tab, IconData icon, String label, {String? badge}) {
     final selected = _tab == tab;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
@@ -200,15 +255,31 @@ class _DesktopShellState extends State<DesktopShell> {
                         ? AppColors.primary
                         : AppColors.textSecondary),
                 const SizedBox(width: 12),
-                Text(label,
-                    style: TextStyle(
-                      fontSize: 14,
-                      fontWeight:
-                          selected ? FontWeight.w600 : FontWeight.w500,
-                      color: selected
-                          ? AppColors.primary
-                          : AppColors.textPrimary,
-                    )),
+                Expanded(
+                  child: Text(label,
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight:
+                            selected ? FontWeight.w600 : FontWeight.w500,
+                        color: selected
+                            ? AppColors.primary
+                            : AppColors.textPrimary,
+                      )),
+                ),
+                if (badge != null)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: AppColors.success.withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(badge,
+                        style: const TextStyle(
+                            fontSize: 9,
+                            fontWeight: FontWeight.w800,
+                            color: AppColors.success)),
+                  ),
               ],
             ),
           ),
@@ -263,9 +334,20 @@ class _DesktopShellState extends State<DesktopShell> {
   // ─── Bottom nav (mobile) ────────────────────────────────
 
   Widget _bottomNav() {
+    // Limit bottom nav to the 5 most-used tabs (NavigationBar caps reasonably
+    // at 5 destinations on mobile). Templates / Guide stay reachable from the
+    // sidebar on tablet/desktop.
+    final destinations = const [
+      _Tab.home,
+      _Tab.newReport,
+      _Tab.reports,
+      _Tab.analytics,
+      _Tab.settings,
+    ];
+    final selectedIndex = destinations.indexOf(_tab).clamp(0, destinations.length - 1);
     return NavigationBar(
-      selectedIndex: _tab.index,
-      onDestinationSelected: (i) => _goTo(_Tab.values[i]),
+      selectedIndex: selectedIndex,
+      onDestinationSelected: (i) => _goTo(destinations[i]),
       destinations: const [
         NavigationDestination(
             icon: Icon(Icons.dashboard_outlined),
@@ -280,13 +362,9 @@ class _DesktopShellState extends State<DesktopShell> {
             selectedIcon: Icon(Icons.folder_rounded),
             label: 'Reports'),
         NavigationDestination(
-            icon: Icon(Icons.description_outlined),
-            selectedIcon: Icon(Icons.description_rounded),
-            label: 'Templates'),
-        NavigationDestination(
-            icon: Icon(Icons.menu_book_outlined),
-            selectedIcon: Icon(Icons.menu_book_rounded),
-            label: 'Guide'),
+            icon: Icon(Icons.insights_outlined),
+            selectedIcon: Icon(Icons.insights_rounded),
+            label: 'Analytics'),
         NavigationDestination(
             icon: Icon(Icons.settings_outlined),
             selectedIcon: Icon(Icons.settings_rounded),

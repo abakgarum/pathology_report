@@ -8,6 +8,13 @@ const int _kReportTypeId = 12;
 const int _kReportStatusTypeId = 13;
 const int _kTemplateTypeId = 15; // bumped: file-only schema
 
+// Parsed template schema (CAP-style synoptic Q&A tree)
+const int _kTemplateQuestionTypeIdEnum = 16;
+const int _kTemplateAnswerTypeId = 17;
+const int _kTemplateQuestionTypeId = 18;
+const int _kTemplateSectionTypeId = 19;
+const int _kTemplateSchemaTypeId = 20;
+
 enum ReportStatus { draft, pending, completed }
 
 extension ReportStatusLabel on ReportStatus {
@@ -120,6 +127,7 @@ class VoiceRecording {
 /// Microscopy & Impression.
 class PathologyReport {
   final String id;
+  String reportUuid; // Stable QR-encoded ID, independent of internal `id` key
   String reportNumber; // e.g. "H-748/2026"
   String patientId;
 
@@ -144,6 +152,11 @@ class PathologyReport {
   List<VoiceRecording> voiceRecordings;
   String summary;
 
+  // Synoptic answers captured during a guided template flow.
+  // Map<questionId, answer> where answer is a String, List<String>, num, or bool.
+  Map<String, dynamic> synopticAnswers;
+  String templateId; // Empty if free-form report; else the TemplateDocument.id used.
+
   ReportStatus status;
   final DateTime createdAt;
   DateTime updatedAt;
@@ -154,6 +167,7 @@ class PathologyReport {
 
   PathologyReport({
     String? id,
+    String? reportUuid,
     required this.reportNumber,
     required this.patientId,
     this.patientName = '',
@@ -171,6 +185,8 @@ class PathologyReport {
     this.rawTranscript = '',
     List<VoiceRecording>? voiceRecordings,
     this.summary = '',
+    Map<String, dynamic>? synopticAnswers,
+    this.templateId = '',
     this.status = ReportStatus.draft,
     DateTime? createdAt,
     DateTime? updatedAt,
@@ -179,13 +195,17 @@ class PathologyReport {
     this.pathologistName = 'Dr. Komal D. Chippalkatti',
     this.pathologistRegistration = 'KMC - 79367',
   })  : id = id ?? const Uuid().v4(),
+        // Default the QR UUID to a fresh v4. Caller can override for legacy reads.
+        reportUuid = reportUuid ?? const Uuid().v4(),
         voiceRecordings = voiceRecordings ?? [],
+        synopticAnswers = synopticAnswers ?? <String, dynamic>{},
         createdAt = createdAt ?? DateTime.now(),
         updatedAt = updatedAt ?? DateTime.now(),
         sampleReceiptDate = sampleReceiptDate ?? DateTime.now(),
         reportedDate = reportedDate ?? DateTime.now();
 
   PathologyReport copyWith({
+    String? reportUuid,
     String? reportNumber,
     String? patientId,
     String? patientName,
@@ -203,6 +223,8 @@ class PathologyReport {
     String? rawTranscript,
     List<VoiceRecording>? voiceRecordings,
     String? summary,
+    Map<String, dynamic>? synopticAnswers,
+    String? templateId,
     ReportStatus? status,
     DateTime? sampleReceiptDate,
     DateTime? reportedDate,
@@ -211,6 +233,7 @@ class PathologyReport {
   }) {
     return PathologyReport(
       id: id,
+      reportUuid: reportUuid ?? this.reportUuid,
       reportNumber: reportNumber ?? this.reportNumber,
       patientId: patientId ?? this.patientId,
       patientName: patientName ?? this.patientName,
@@ -228,6 +251,8 @@ class PathologyReport {
       rawTranscript: rawTranscript ?? this.rawTranscript,
       voiceRecordings: voiceRecordings ?? this.voiceRecordings,
       summary: summary ?? this.summary,
+      synopticAnswers: synopticAnswers ?? this.synopticAnswers,
+      templateId: templateId ?? this.templateId,
       status: status ?? this.status,
       createdAt: createdAt,
       updatedAt: DateTime.now(),
@@ -284,6 +309,115 @@ class TemplateDocument {
       createdAt: createdAt,
       updatedAt: DateTime.now(),
     );
+  }
+}
+
+// ─── Parsed template schema (CAP-style synoptic) ────────────────────────────
+
+enum TemplateQuestionType { singleSelect, multiSelect, text, integer, decimal, date }
+
+extension TemplateQuestionTypeLabel on TemplateQuestionType {
+  String get label {
+    switch (this) {
+      case TemplateQuestionType.singleSelect:
+        return 'Single choice';
+      case TemplateQuestionType.multiSelect:
+        return 'Multiple choice';
+      case TemplateQuestionType.text:
+        return 'Free text';
+      case TemplateQuestionType.integer:
+        return 'Integer';
+      case TemplateQuestionType.decimal:
+        return 'Decimal';
+      case TemplateQuestionType.date:
+        return 'Date';
+    }
+  }
+}
+
+/// One answer choice. `triggersQuestionIds` are the IDs of questions revealed
+/// when this answer is picked (CAP "DisablesChildren" — a misnomer; in SDC it
+/// actually *enables* nested questions). `disablesAnswerIds` are answer IDs
+/// inside the same question that selecting this one removes (mutual exclusion
+/// stronger than radio behavior).
+class TemplateAnswer {
+  final String id;
+  String label;
+  List<String> triggersQuestionIds;
+  List<String> disablesAnswerIds;
+
+  TemplateAnswer({
+    String? id,
+    required this.label,
+    List<String>? triggersQuestionIds,
+    List<String>? disablesAnswerIds,
+  })  : id = id ?? const Uuid().v4(),
+        triggersQuestionIds = triggersQuestionIds ?? const [],
+        disablesAnswerIds = disablesAnswerIds ?? const [];
+}
+
+class TemplateQuestion {
+  final String id;
+  String label;
+  TemplateQuestionType type;
+  bool required;
+  String units; // empty if not numeric
+  List<TemplateAnswer> answers; // empty for free-text/numeric
+  bool freeTextAllowed; // for selects with an "Other (specify)" affordance
+  String parentAnswerId; // empty for top-level questions
+
+  TemplateQuestion({
+    String? id,
+    required this.label,
+    this.type = TemplateQuestionType.singleSelect,
+    this.required = true,
+    this.units = '',
+    List<TemplateAnswer>? answers,
+    this.freeTextAllowed = false,
+    this.parentAnswerId = '',
+  })  : id = id ?? const Uuid().v4(),
+        answers = answers ?? [];
+}
+
+class TemplateSection {
+  String title;
+  List<TemplateQuestion> questions;
+
+  TemplateSection({required this.title, List<TemplateQuestion>? questions})
+      : questions = questions ?? [];
+}
+
+/// Parsed structure for one TemplateDocument. Keyed by [templateId] so the
+/// schema box can be looked up directly with the template's id.
+class TemplateSchema {
+  final String templateId;
+  String version;
+  List<TemplateSection> sections;
+  final DateTime parsedAt;
+
+  TemplateSchema({
+    required this.templateId,
+    this.version = '',
+    List<TemplateSection>? sections,
+    DateTime? parsedAt,
+  })  : sections = sections ?? [],
+        parsedAt = parsedAt ?? DateTime.now();
+
+  int get totalQuestions =>
+      sections.fold<int>(0, (sum, s) => sum + s.questions.length);
+
+  /// Flat list of all questions across sections (preserving order).
+  List<TemplateQuestion> get allQuestions => [
+        for (final s in sections) ...s.questions,
+      ];
+
+  TemplateQuestion? questionById(String id) {
+    for (final s in sections) {
+      for (final q in s.questions) {
+        if (q.id == id) return q;
+      }
+    }
+    return null;
   }
 }
 
@@ -411,37 +545,79 @@ class PathologyReportAdapter extends TypeAdapter<PathologyReport> {
 
   @override
   PathologyReport read(BinaryReader reader) {
+    final id = reader.readString();
+    final reportNumber = reader.readString();
+    final patientId = reader.readString();
+    final patientName = reader.readString();
+    final patientAge = reader.readInt();
+    final patientGender = reader.readString();
+    final mrn = reader.readString();
+    final labNo = reader.readString();
+    final visitNo = reader.readString();
+    final orderedBy = reader.readString();
+    final referredBy = reader.readString();
+    final clinicalInformation = reader.readString();
+    final specimen = reader.readString();
+    final grossExamination = reader.readString();
+    final microscopyImpression = reader.readString();
+    final rawTranscript = reader.readString();
+    final voiceRecordings = (reader.readList()).cast<VoiceRecording>();
+    final summary = reader.readString();
+    final status = ReportStatus.values[
+        reader.readInt().clamp(0, ReportStatus.values.length - 1)];
+    final createdAt =
+        DateTime.fromMillisecondsSinceEpoch(reader.readInt(), isUtc: false);
+    final updatedAt =
+        DateTime.fromMillisecondsSinceEpoch(reader.readInt(), isUtc: false);
+    final sampleReceiptDate =
+        DateTime.fromMillisecondsSinceEpoch(reader.readInt(), isUtc: false);
+    final reportedDate =
+        DateTime.fromMillisecondsSinceEpoch(reader.readInt(), isUtc: false);
+    final pathologistName = reader.readString();
+    final pathologistRegistration = reader.readString();
+
+    // Backward-compat: fields appended after v1. If the binary record was
+    // written before they existed, BinaryReader.availableBytes is 0 and we
+    // fall back to safe defaults (reportUuid copies `id` so old reports get
+    // a stable QR-encodable identifier without rewriting storage).
+    String reportUuid = id;
+    Map<String, dynamic> synopticAnswers = <String, dynamic>{};
+    String templateId = '';
+    if (reader.availableBytes > 0) reportUuid = reader.readString();
+    if (reader.availableBytes > 0) {
+      synopticAnswers = Map<String, dynamic>.from(reader.readMap());
+    }
+    if (reader.availableBytes > 0) templateId = reader.readString();
+
     return PathologyReport(
-      id: reader.readString(),
-      reportNumber: reader.readString(),
-      patientId: reader.readString(),
-      patientName: reader.readString(),
-      patientAge: reader.readInt(),
-      patientGender: reader.readString(),
-      mrn: reader.readString(),
-      labNo: reader.readString(),
-      visitNo: reader.readString(),
-      orderedBy: reader.readString(),
-      referredBy: reader.readString(),
-      clinicalInformation: reader.readString(),
-      specimen: reader.readString(),
-      grossExamination: reader.readString(),
-      microscopyImpression: reader.readString(),
-      rawTranscript: reader.readString(),
-      voiceRecordings: (reader.readList()).cast<VoiceRecording>(),
-      summary: reader.readString(),
-      status: ReportStatus.values[
-          reader.readInt().clamp(0, ReportStatus.values.length - 1)],
-      createdAt:
-          DateTime.fromMillisecondsSinceEpoch(reader.readInt(), isUtc: false),
-      updatedAt:
-          DateTime.fromMillisecondsSinceEpoch(reader.readInt(), isUtc: false),
-      sampleReceiptDate:
-          DateTime.fromMillisecondsSinceEpoch(reader.readInt(), isUtc: false),
-      reportedDate:
-          DateTime.fromMillisecondsSinceEpoch(reader.readInt(), isUtc: false),
-      pathologistName: reader.readString(),
-      pathologistRegistration: reader.readString(),
+      id: id,
+      reportUuid: reportUuid,
+      reportNumber: reportNumber,
+      patientId: patientId,
+      patientName: patientName,
+      patientAge: patientAge,
+      patientGender: patientGender,
+      mrn: mrn,
+      labNo: labNo,
+      visitNo: visitNo,
+      orderedBy: orderedBy,
+      referredBy: referredBy,
+      clinicalInformation: clinicalInformation,
+      specimen: specimen,
+      grossExamination: grossExamination,
+      microscopyImpression: microscopyImpression,
+      rawTranscript: rawTranscript,
+      voiceRecordings: voiceRecordings,
+      summary: summary,
+      synopticAnswers: synopticAnswers,
+      templateId: templateId,
+      status: status,
+      createdAt: createdAt,
+      updatedAt: updatedAt,
+      sampleReceiptDate: sampleReceiptDate,
+      reportedDate: reportedDate,
+      pathologistName: pathologistName,
+      pathologistRegistration: pathologistRegistration,
     );
   }
 
@@ -472,5 +648,126 @@ class PathologyReportAdapter extends TypeAdapter<PathologyReport> {
     writer.writeInt(obj.reportedDate.millisecondsSinceEpoch);
     writer.writeString(obj.pathologistName);
     writer.writeString(obj.pathologistRegistration);
+    // Appended fields — order matters for backward-compatible reads.
+    writer.writeString(obj.reportUuid);
+    writer.writeMap(obj.synopticAnswers);
+    writer.writeString(obj.templateId);
+  }
+}
+
+// ─── Template schema adapters ───────────────────────────────────────
+
+class TemplateQuestionTypeAdapter extends TypeAdapter<TemplateQuestionType> {
+  @override
+  final int typeId = _kTemplateQuestionTypeIdEnum;
+
+  @override
+  TemplateQuestionType read(BinaryReader reader) {
+    final idx = reader.readInt();
+    return TemplateQuestionType.values[
+        idx.clamp(0, TemplateQuestionType.values.length - 1)];
+  }
+
+  @override
+  void write(BinaryWriter writer, TemplateQuestionType obj) {
+    writer.writeInt(obj.index);
+  }
+}
+
+class TemplateAnswerAdapter extends TypeAdapter<TemplateAnswer> {
+  @override
+  final int typeId = _kTemplateAnswerTypeId;
+
+  @override
+  TemplateAnswer read(BinaryReader reader) {
+    return TemplateAnswer(
+      id: reader.readString(),
+      label: reader.readString(),
+      triggersQuestionIds: reader.readStringList(),
+      disablesAnswerIds: reader.readStringList(),
+    );
+  }
+
+  @override
+  void write(BinaryWriter writer, TemplateAnswer obj) {
+    writer.writeString(obj.id);
+    writer.writeString(obj.label);
+    writer.writeStringList(obj.triggersQuestionIds);
+    writer.writeStringList(obj.disablesAnswerIds);
+  }
+}
+
+class TemplateQuestionAdapter extends TypeAdapter<TemplateQuestion> {
+  @override
+  final int typeId = _kTemplateQuestionTypeId;
+
+  @override
+  TemplateQuestion read(BinaryReader reader) {
+    return TemplateQuestion(
+      id: reader.readString(),
+      label: reader.readString(),
+      type: TemplateQuestionType.values[
+          reader.readInt().clamp(0, TemplateQuestionType.values.length - 1)],
+      required: reader.readBool(),
+      units: reader.readString(),
+      answers: (reader.readList()).cast<TemplateAnswer>(),
+      freeTextAllowed: reader.readBool(),
+      parentAnswerId: reader.readString(),
+    );
+  }
+
+  @override
+  void write(BinaryWriter writer, TemplateQuestion obj) {
+    writer.writeString(obj.id);
+    writer.writeString(obj.label);
+    writer.writeInt(obj.type.index);
+    writer.writeBool(obj.required);
+    writer.writeString(obj.units);
+    writer.writeList(obj.answers);
+    writer.writeBool(obj.freeTextAllowed);
+    writer.writeString(obj.parentAnswerId);
+  }
+}
+
+class TemplateSectionAdapter extends TypeAdapter<TemplateSection> {
+  @override
+  final int typeId = _kTemplateSectionTypeId;
+
+  @override
+  TemplateSection read(BinaryReader reader) {
+    return TemplateSection(
+      title: reader.readString(),
+      questions: (reader.readList()).cast<TemplateQuestion>(),
+    );
+  }
+
+  @override
+  void write(BinaryWriter writer, TemplateSection obj) {
+    writer.writeString(obj.title);
+    writer.writeList(obj.questions);
+  }
+}
+
+class TemplateSchemaAdapter extends TypeAdapter<TemplateSchema> {
+  @override
+  final int typeId = _kTemplateSchemaTypeId;
+
+  @override
+  TemplateSchema read(BinaryReader reader) {
+    return TemplateSchema(
+      templateId: reader.readString(),
+      version: reader.readString(),
+      sections: (reader.readList()).cast<TemplateSection>(),
+      parsedAt:
+          DateTime.fromMillisecondsSinceEpoch(reader.readInt(), isUtc: false),
+    );
+  }
+
+  @override
+  void write(BinaryWriter writer, TemplateSchema obj) {
+    writer.writeString(obj.templateId);
+    writer.writeString(obj.version);
+    writer.writeList(obj.sections);
+    writer.writeInt(obj.parsedAt.millisecondsSinceEpoch);
   }
 }
