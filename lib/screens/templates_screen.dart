@@ -704,7 +704,12 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
       if (Platform.isMacOS) {
         await Process.run('open', ['-R', t.filePath]);
       } else if (Platform.isWindows) {
-        await Process.run('explorer.exe', ['/select,', t.filePath]);
+        // explorer.exe expects `/select,<path>` as a SINGLE argument with
+        // native backslashes — passing them as two args silently opens the
+        // user's home folder instead of selecting the file.
+        final winPath = t.filePath.replaceAll('/', r'\');
+        await Process.run('explorer.exe', ['/select,$winPath'],
+            runInShell: true);
       } else {
         await Process.run('xdg-open', [p.dirname(t.filePath)]);
       }

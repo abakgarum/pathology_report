@@ -132,14 +132,19 @@ class VoiceCommandService {
       _log('info',
           'initialize() returned available=$_available · hasPermission=$hasPerm');
       if (!_available) {
-        // Compose a specific hint for the user.
+        // Compose a specific, platform-aware hint for the user.
         String hint;
-        if (!hasPerm) {
-          hint =
-              'Missing Microphone or Speech Recognition permission. Open System Settings → Privacy & Security, enable both, then tap Retry.';
+        if (Platform.isWindows) {
+          hint = !hasPerm
+              ? 'Microphone access is blocked. Open Windows Settings → Privacy & security → Microphone, allow desktop apps, then tap Retry.'
+              : 'Windows Speech Recognition is unavailable. Open Settings → Time & Language → Speech, install the en-US speech pack and turn on online speech recognition, then tap Retry.';
+        } else if (Platform.isMacOS || Platform.isIOS) {
+          hint = !hasPerm
+              ? 'Missing Microphone or Speech Recognition permission. Open System Settings → Privacy & Security, enable both, then tap Retry.'
+              : 'Recognizer unavailable even though permission is granted. This usually means the OS speech service has not installed the en_US model yet. Wait a minute and retry, or open System Settings → Keyboard → Dictation and enable Dictation once.';
         } else {
           hint =
-              'Recognizer unavailable even though permission is granted. This usually means the OS speech service has not installed the en_US model yet. Wait a minute and retry, or open System Settings → Keyboard → Dictation and enable Dictation once.';
+              'Voice recognition is not supported on this platform. You can still use the app with touch and the on-screen keyboard.';
         }
         if (_lastError.isEmpty) _lastError = hint;
         _log('error', hint);
@@ -206,14 +211,23 @@ class VoiceCommandService {
   }
 
   Future<void> start() async {
-    _log('info', 'start() called · initialized=$_initialized · available=$_available');
-    if (!_initialized) await init();
-    if (!_available) {
-      _log('error', 'Cannot start — recognizer unavailable.');
-      return;
+    try {
+      _log('info',
+          'start() called · initialized=$_initialized · available=$_available');
+      if (!_initialized) await init();
+      if (!_available) {
+        _log('error', 'Cannot start — recognizer unavailable.');
+        return;
+      }
+      _shouldListen = true;
+      await _listenOnce();
+    } catch (e, st) {
+      // Never let an unawaited start() take down the calling screen. The home
+      // page fires this in initState without an await, so any throw here
+      // becomes an unhandled async error that surfaces as a red-screen crash.
+      _log('error', 'start() threw: $e\n$st');
+      _currentlyListening = false;
     }
-    _shouldListen = true;
-    await _listenOnce();
   }
 
   Future<void> stop() async {
@@ -257,7 +271,9 @@ class VoiceCommandService {
         listenOptions: stt.SpeechListenOptions(
           partialResults: true,
           listenMode: stt.ListenMode.dictation,
-          onDevice: Platform.isMacOS || Platform.isIOS,
+          // Windows speech recognition is on-device only; iOS / macOS support
+          // local recognition explicitly. Android falls back to cloud.
+          onDevice: Platform.isMacOS || Platform.isIOS || Platform.isWindows,
           autoPunctuation: true,
           enableHapticFeedback: false,
         ),
@@ -326,8 +342,9 @@ class VoiceCommandService {
           partialResults: true,
           listenMode: stt.ListenMode.dictation,
           // onDevice forces the local model on macOS / iOS — no network
-          // round-trip per partial, smoother live transcription.
-          onDevice: Platform.isMacOS || Platform.isIOS,
+          // round-trip per partial. Windows speech recognition is on-device
+          // only, so request the local model there too.
+          onDevice: Platform.isMacOS || Platform.isIOS || Platform.isWindows,
           autoPunctuation: true,
           enableHapticFeedback: false,
         ),

@@ -56,8 +56,15 @@ class _DesktopShellState extends State<DesktopShell> {
   }
 
   Future<void> _initVoice() async {
-    final ok = await _voice.init();
-    if (ok) await _voice.start();
+    try {
+      final ok = await _voice.init();
+      if (ok) await _voice.start();
+    } catch (e) {
+      // The voice service already swallows its own errors, but guard the
+      // shell too so a future regression in init() can never crash the
+      // first frame of the home page.
+      debugPrint('desktop_shell: voice init failed: $e');
+    }
   }
 
   void _onSettingsChanged() {

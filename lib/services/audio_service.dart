@@ -29,12 +29,20 @@ class AudioService {
   Stream<double> get amplitudeStream => _amplitudeController.stream;
 
   Future<bool> hasPermission() async {
-    return await _recorder.hasPermission();
+    try {
+      return await _recorder.hasPermission();
+    } catch (_) {
+      // record_windows / record_linux can throw MissingPluginException when
+      // the host machine has no working audio capture stack. Treat that as
+      // "no permission" so the caller surfaces a clean error instead of
+      // crashing the screen.
+      return false;
+    }
   }
 
   Future<String?> startRecording({String? label}) async {
     try {
-      if (!await _recorder.hasPermission()) {
+      if (!await hasPermission()) {
         return null;
       }
 

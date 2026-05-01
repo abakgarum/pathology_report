@@ -51,11 +51,19 @@ class _HomeVoiceScreenState extends State<HomeVoiceScreen>
     _pulseAnim = Tween<double>(begin: 1, end: 1.25)
         .animate(CurvedAnimation(parent: _pulse, curve: Curves.easeInOut));
 
-    _cmdSub = _voice.commands.listen(_onCommand);
-    _transcriptSub = _voice.transcript.listen((u) {
-      if (mounted) setState(() => _liveTranscript = u.text);
-    });
-    _voice.start();
+    // Voice is best-effort. On platforms without a working speech recognizer
+    // (Linux, Windows machines without the en_US speech pack) the service
+    // surfaces an unavailable state instead of throwing, so the home page
+    // stays usable via taps and the side nav.
+    try {
+      _cmdSub = _voice.commands.listen(_onCommand);
+      _transcriptSub = _voice.transcript.listen((u) {
+        if (mounted) setState(() => _liveTranscript = u.text);
+      });
+    } catch (e) {
+      debugPrint('home_voice_screen: voice stream subscribe failed: $e');
+    }
+    unawaited(_voice.start());
   }
 
   @override
