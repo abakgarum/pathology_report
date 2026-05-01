@@ -54,17 +54,16 @@ class VoiceCommandService {
   bool _initialized = false;
   bool _shouldListen = false;
   bool _currentlyListening = false;
+  // Re-entry guard: SFSpeechRecognizer owns a single AVAudioEngine input-node
+  // singleton. Two `listen()` calls in flight at the same time crash with a
+  // pointer-authentication failure on macOS (one engine tears down while
+  // another grabs the input node). We serialize all listen attempts with this
+  // flag — no overlap, ever.
+  bool _listenInFlight = false;
   String _lastMatched = '';
   DateTime _lastMatchTime = DateTime.fromMillisecondsSinceEpoch(0);
   String _lastError = '';
   String _lastStatus = '';
-
-  // Proactive-restart window. SFSpeechRecognizer finalizes around 60s of
-  // silence; we re-arm at 45s so the seam is invisible.
-  static const Duration _listenWindow = Duration(seconds: 50);
-  static const Duration _proactiveRefresh = Duration(seconds: 45);
-  Timer? _refreshTimer;
-  DateTime _listenStartedAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   final _commandController = StreamController<VoiceCommandEvent>.broadcast();
   final _transcriptController =
@@ -164,7 +163,6 @@ class VoiceCommandService {
   /// "Retry" button in the UI after the user grants permission.
   Future<bool> reinit() async {
     _log('info', 'reinit() called — tearing down…');
-    _refreshTimer?.cancel();
     try {
       await _stt.stop();
     } catch (_) {}
@@ -172,6 +170,7 @@ class VoiceCommandService {
     _available = false;
     _currentlyListening = false;
     _shouldListen = false;
+    _listenInFlight = false;
     _lastError = '';
     final ok = await init();
     if (ok) {
@@ -220,7 +219,6 @@ class VoiceCommandService {
   Future<void> stop() async {
     _log('info', 'stop() called');
     _shouldListen = false;
-    _refreshTimer?.cancel();
     try {
       await _stt.stop();
     } catch (e) {
@@ -240,7 +238,6 @@ class VoiceCommandService {
     if (!_available) return '';
     final wasListening = _shouldListen;
     _shouldListen = false;
-    _refreshTimer?.cancel();
     try {
       await _stt.stop();
     } catch (_) {}
@@ -283,7 +280,6 @@ class VoiceCommandService {
 
   void dispose() {
     _shouldListen = false;
-    _refreshTimer?.cancel();
     _stt.stop();
     _commandController.close();
     _transcriptController.close();
@@ -302,60 +298,59 @@ class VoiceCommandService {
       _log('info', '_listenOnce: shouldListen=false, skipping');
       return;
     }
-    // If already listening AND we're inside the proactive-refresh window,
-    // cycle the recognizer to re-arm a fresh task before the OS finalizes
-    // the current one. This is what gives "smooth" continuous transcription.
-    if (_currentlyListening) {
-      try {
-        await _stt.stop();
-      } catch (_) {}
-      _currentlyListening = false;
+    // Re-entry guard. SFSpeechRecognizer crashes (PAC failure on the input
+    // node singleton) when two `listen()` calls are in flight at the same
+    // time — the original symptom was an immediate EXC_BAD_ACCESS in
+    // AVAudioIONodeImpl::AUI() on macOS 26. We never overlap.
+    if (_listenInFlight) {
+      _log('info', '_listenOnce: another listen() is in flight, skipping');
+      return;
     }
-
+    if (_currentlyListening) {
+      _log('info', '_listenOnce: already listening, skipping');
+      return;
+    }
+    _listenInFlight = true;
     try {
       _log('info',
           '_listenOnce: calling stt.listen(locale=${SettingsService.getLocale()})');
       await _stt.listen(
         onResult: _onResult,
-        listenFor: _listenWindow,
+        // Long listen window — Apple removes the historical 1-minute server
+        // cap when on-device recognition is enabled, so a 5-minute window is
+        // safe and avoids forced restarts within a typical dictation.
+        listenFor: const Duration(minutes: 5),
         pauseFor: const Duration(seconds: 10),
         localeId: SettingsService.getLocale(),
         listenOptions: stt.SpeechListenOptions(
           partialResults: true,
           listenMode: stt.ListenMode.dictation,
           // onDevice forces the local model on macOS / iOS — no network
-          // round-trip per partial, removes most of the visible stutter.
+          // round-trip per partial, smoother live transcription.
           onDevice: Platform.isMacOS || Platform.isIOS,
           autoPunctuation: true,
           enableHapticFeedback: false,
         ),
       );
       _currentlyListening = true;
-      _listenStartedAt = DateTime.now();
-      _scheduleProactiveRefresh();
       _log('info', 'stt.listen() succeeded — now listening');
     } catch (e, st) {
       _log('error', '_listenOnce threw: $e\n$st');
       _currentlyListening = false;
       _restartIfNeeded();
+    } finally {
+      _listenInFlight = false;
     }
   }
 
-  void _scheduleProactiveRefresh() {
-    _refreshTimer?.cancel();
-    _refreshTimer = Timer(_proactiveRefresh, () async {
-      if (!_shouldListen) return;
-      final age = DateTime.now().difference(_listenStartedAt);
-      if (age < _proactiveRefresh) return;
-      _log('info',
-          'proactive refresh (age=${age.inSeconds}s) — cycling recognizer');
-      await _listenOnce();
-    });
-  }
-
+  /// Reactive restart: invoked from the recognizer's `done` / `notListening`
+  /// status callback. We wait a beat to give the OS audio engine time to
+  /// fully tear down before re-arming — this is the difference between a
+  /// clean restart and the PAC-failure crash we used to see when restarting
+  /// too eagerly.
   void _restartIfNeeded() {
     if (!_shouldListen) return;
-    Future.delayed(const Duration(milliseconds: 200), _listenOnce);
+    Future.delayed(const Duration(milliseconds: 600), _listenOnce);
   }
 
   void _onResult(SpeechRecognitionResult r) {
