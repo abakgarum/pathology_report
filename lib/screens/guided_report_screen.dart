@@ -90,6 +90,13 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
   // so we can transcribe with Whisper).
   bool _recording = false;
   Duration _recordingDuration = Duration.zero;
+  // Question id currently being Whisper-transcribed, so the per-question UI
+  // can show a spinner while the API call is in flight.
+  String? _transcribingQuestionId;
+  // Raw audio captured per question — kept on the saved report so the detail
+  // screen's playback panel can replay each clip and the doctor can correct
+  // any Whisper mis-hears against the original audio.
+  final List<VoiceRecording> _recordings = <VoiceRecording>[];
 
   String _statusMessage = '';
   bool _composing = false;
@@ -569,38 +576,98 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
   Future<void> _stopRecordingForCurrent() async {
     if (!_recording) return;
     final q = _currentQuestion;
+    // Snapshot what the on-device recognizer captured *before* we stop, so a
+    // Whisper failure still leaves a usable transcript on the saved clip.
+    final liveSeed = '${_liveFinal.trim()} ${_livePartial.trim()}'.trim();
+    final clipDuration = _recordingDuration;
     final path = await _audio.stopRecording();
     setState(() => _recording = false);
     if (path == null || q == null) return;
+
+    // Persist the raw clip immediately — the detail screen's playback panel
+    // pulls from this list, and we want the file kept even if Whisper errors
+    // or the user backs out.
+    final rec = VoiceRecording(
+      filePath: path,
+      duration: clipDuration,
+      label: q.label,
+      transcription: liveSeed,
+    );
+    setState(() {
+      _recordings.add(rec);
+      _transcribingQuestionId = q.id;
+      _statusMessage = 'Transcribing "${q.label}"…';
+    });
+
     // Whisper-correct the captured audio so the answer is high-accuracy.
     try {
       final text = await OpenAIService.transcribeAudio(
         path,
         prompt: 'Histopathology answer to: ${q.label}',
       );
-      if (text.trim().isEmpty) return;
-      if (q.type == TemplateQuestionType.text) {
-        setState(() {
-          _textAnswers[q.id] = text;
-          _answers[q.id] = text;
-        });
-      } else if (q.type == TemplateQuestionType.integer ||
-          q.type == TemplateQuestionType.decimal) {
-        final n = _extractNumber(text);
-        if (n != null) setState(() => _answers[q.id] = n);
-      } else if (q.type == TemplateQuestionType.singleSelect ||
-          q.type == TemplateQuestionType.multiSelect) {
-        final matched = _fuzzyMatchAnswer(text, q.answers);
-        if (matched != null) _selectAnswer(q, matched);
+      if (!mounted) return;
+      final corrected = text.trim();
+      if (corrected.isEmpty) {
+        _setStatus(liveSeed.isEmpty
+            ? 'Whisper returned no text — try dictating again.'
+            : 'Whisper returned no text — kept live transcript.');
+      } else {
+        // Upgrade the stored clip transcription to the Whisper version.
+        final idx = _recordings.indexWhere((r) => r.id == rec.id);
+        if (idx != -1) {
+          _recordings[idx] = _recordings[idx].copyWith(transcription: corrected);
+        }
+        if (q.type == TemplateQuestionType.text) {
+          setState(() {
+            _textAnswers[q.id] = corrected;
+            _answers[q.id] = corrected;
+            _statusMessage = 'Answer captured.';
+          });
+        } else if (q.type == TemplateQuestionType.integer ||
+            q.type == TemplateQuestionType.decimal) {
+          final n = _extractNumber(corrected);
+          if (n != null) {
+            setState(() {
+              _answers[q.id] = n;
+              _statusMessage = 'Answer captured.';
+            });
+          } else {
+            _setStatus('Could not read a number from "$corrected".');
+          }
+        } else if (q.type == TemplateQuestionType.singleSelect ||
+            q.type == TemplateQuestionType.multiSelect) {
+          final matched = _fuzzyMatchAnswer(corrected, q.answers);
+          if (matched != null) {
+            _selectAnswer(q, matched);
+            _setStatus('Answer captured.');
+          } else {
+            _setStatus('No matching choice for "$corrected" — pick one or retry.');
+          }
+        }
       }
     } catch (e) {
-      _setStatus('Whisper failed — using live transcript · $e');
+      if (!mounted) return;
+      _setStatus(liveSeed.isEmpty
+          ? 'Whisper failed — re-record or type the answer · $e'
+          : 'Whisper failed — kept live transcript · $e');
+    } finally {
+      if (mounted) setState(() => _transcribingQuestionId = null);
     }
   }
 
   // ─── Compose & save ───────────────────────────────────────────────────
 
   Future<void> _composeAndSave() async {
+    if (_composing) return;
+    // If a Whisper call is still in flight, wait it out so its corrected
+    // transcript makes it into the saved clip.
+    if (_transcribingQuestionId != null) {
+      _setStatus('Waiting for transcription to finish…');
+      while (_transcribingQuestionId != null && mounted) {
+        await Future.delayed(const Duration(milliseconds: 120));
+      }
+      if (!mounted) return;
+    }
     setState(() {
       _composing = true;
       _statusMessage = 'Composing synoptic report…';
@@ -617,6 +684,17 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
       );
       final reportNumber = HiveStorageService.nextReportNumber();
       final existing = HiveStorageService.getPatient(_confirmedPatientId);
+      // Joined per-question dictation — keeps the same shape the free-form
+      // voice flow uses, so the detail screen's "generated script" panel has
+      // something to fall back to.
+      final rawTranscript = _recordings
+          .map((r) {
+            final t = r.transcription.trim();
+            if (t.isEmpty) return '';
+            return r.label.isEmpty ? t : '${r.label}: $t';
+          })
+          .where((s) => s.isNotEmpty)
+          .join('\n\n');
       final report = PathologyReport(
         reportNumber: reportNumber,
         patientId: _confirmedPatientId,
@@ -635,7 +713,8 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
         // existing report layout. composeSynopticReport returns it as 'synoptic'.
         microscopyImpression: composed['synoptic'] ?? '',
         summary: composed['summary'] ?? '',
-        rawTranscript: '',
+        rawTranscript: rawTranscript,
+        voiceRecordings: List.of(_recordings),
         synopticAnswers: Map<String, dynamic>.from(_answers),
         templateId: _pickedTemplate!.id,
         status: ReportStatus.pending,
@@ -646,16 +725,19 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
       );
       await HiveStorageService.saveReport(report);
       widget.onReportSaved?.call(report);
+      if (!mounted) return;
       setState(() {
         _composing = false;
         _saved = true;
         _composedReport = report;
-        _statusMessage = 'Saved ${report.reportNumber}.';
+        _statusMessage =
+            'Saved ${report.reportNumber}${_recordings.isEmpty ? '' : ' · ${_recordings.length} clip(s) attached'}.';
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _composing = false;
-        _statusMessage = 'Compose failed — $e';
+        _statusMessage = 'Compose failed — $e. Your answers and recordings are kept; tap "Save report" to retry.';
       });
     }
   }
@@ -1278,29 +1360,45 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
   }
 
   Widget _recordButtonRow() {
+    final transcribing = _transcribingQuestionId != null &&
+        _transcribingQuestionId == _currentQuestion?.id;
     return Row(
       children: [
         FilledButton.icon(
-          onPressed: _recording
-              ? _stopRecordingForCurrent
-              : _startRecordingForCurrent,
+          onPressed: transcribing
+              ? null
+              : (_recording
+                  ? _stopRecordingForCurrent
+                  : _startRecordingForCurrent),
           style: FilledButton.styleFrom(
-            backgroundColor:
-                _recording ? AppColors.error : AppColors.primary,
+            backgroundColor: transcribing
+                ? AppColors.textHint
+                : (_recording ? AppColors.error : AppColors.primary),
           ),
-          icon: Icon(
-              _recording ? Icons.stop_rounded : Icons.mic_rounded,
-              size: 16),
-          label: Text(_recording
-              ? 'Stop (${_fmtDur(_recordingDuration)})'
-              : 'Dictate'),
+          icon: transcribing
+              ? const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 2, color: Colors.white))
+              : Icon(_recording ? Icons.stop_rounded : Icons.mic_rounded,
+                  size: 16),
+          label: Text(transcribing
+              ? 'Transcribing…'
+              : (_recording
+                  ? 'Stop (${_fmtDur(_recordingDuration)})'
+                  : 'Dictate')),
         ),
         const SizedBox(width: 8),
-        Text(
-          _recording
-              ? 'Recording — speak the answer.'
-              : 'Tap to capture a high-accuracy Whisper answer.',
-          style: Theme.of(context).textTheme.bodySmall,
+        Expanded(
+          child: Text(
+            transcribing
+                ? 'Sending audio to Whisper — this usually takes a few seconds.'
+                : (_recording
+                    ? 'Recording — speak the answer.'
+                    : 'Tap to capture a high-accuracy Whisper answer.'),
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
         ),
       ],
     );
