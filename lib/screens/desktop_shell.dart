@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../models/report_models.dart';
 import '../services/hive_storage_service.dart';
 import '../services/settings_service.dart';
 import '../services/voice_command_service.dart';
@@ -32,6 +33,13 @@ enum _Tab {
   templates,
   guide,
   settings,
+}
+
+/// Pairs a template with its parsed schema for the wizard's picker step.
+class _TemplateOption {
+  final TemplateDocument template;
+  final TemplateSchema schema;
+  const _TemplateOption({required this.template, required this.schema});
 }
 
 class _DesktopShellState extends State<DesktopShell> {
@@ -141,24 +149,34 @@ class _DesktopShellState extends State<DesktopShell> {
   }
 
   /// Decide between the guided wizard and the legacy free-form screen.
-  /// The wizard is only used when an active template exists *and* it has
-  /// been parsed into a schema. Otherwise the lab gets the original
-  /// dictation-only experience — no functionality regression.
+  ///
+  /// The wizard is used when ANY parsed template exists. It opens with a
+  /// template picker (voice or tap); if the doctor doesn't choose one, it
+  /// falls back to the active default. With zero parsed templates, the lab
+  /// gets the original dictation-only experience — no regression.
   Widget _routeNewReport() {
-    final activeId = SettingsService.getActiveTemplateId();
-    if (activeId.isNotEmpty) {
-      final template = HiveStorageService.getTemplate(activeId);
-      final schema = HiveStorageService.getTemplateSchema(activeId);
-      if (template != null && schema != null && schema.totalQuestions > 0) {
-        return GuidedReportScreen(
-          template: template,
-          schema: schema,
-          onBack: () => _goTo(_Tab.home),
-          onReportSaved: (_) => _goTo(_Tab.reports),
-        );
+    final allTemplates = HiveStorageService.allTemplates();
+    final usable = <_TemplateOption>[];
+    for (final t in allTemplates) {
+      final schema = HiveStorageService.getTemplateSchema(t.id);
+      if (schema != null && schema.totalQuestions > 0) {
+        usable.add(_TemplateOption(template: t, schema: schema));
       }
     }
-    return VoiceReportScreen(
+    if (usable.isEmpty) {
+      return VoiceReportScreen(
+        onBack: () => _goTo(_Tab.home),
+        onReportSaved: (_) => _goTo(_Tab.reports),
+      );
+    }
+    final activeId = SettingsService.getActiveTemplateId();
+    final defaultIndex = activeId.isEmpty
+        ? 0
+        : usable.indexWhere((o) => o.template.id == activeId).clamp(0, usable.length - 1);
+    return GuidedReportScreen(
+      templates: usable.map((o) => o.template).toList(),
+      schemas: {for (final o in usable) o.template.id: o.schema},
+      defaultTemplateId: usable[defaultIndex].template.id,
       onBack: () => _goTo(_Tab.home),
       onReportSaved: (_) => _goTo(_Tab.reports),
     );

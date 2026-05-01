@@ -12,31 +12,37 @@ import '../theme/app_theme.dart';
 
 /// Voice-driven guided wizard backed by a parsed `TemplateSchema`.
 ///
-/// Flow per question:
-///   1. Wizard shows the current question + answer choices.
-///   2. The doctor either taps an answer OR says it.
-///       - For singleSelect / multiSelect, the live transcript is fuzzy-matched
-///         against the answer labels.
+/// Flow:
+///   0. (Step 0) Pick template — by voice ("use breast template") or tap.
+///      If only one template exists, this step is auto-skipped. If the
+///      doctor says "next" / "confirm" without picking, the configured
+///      default ([defaultTemplateId]) is used.
+///   1. (Step 1) Confirm patient ID.
+///   2. Walk through the schema's questions one at a time.
+///       - For singleSelect / multiSelect, the live transcript is fuzzy-
+///         matched against the answer labels.
 ///       - For free-text, the running transcript becomes the answer (refined
 ///         by Whisper when the doctor advances).
 ///       - For integer/decimal, digits/number-words are extracted via
 ///         `VoiceCommandService.normalizeSpokenId`.
-///   3. Saying "next" / tapping Next advances. Branching: if the picked
-///      answer triggers child questions, those are inserted into the queue
-///      after the current position.
-///   4. Saying "previous" / tapping Back walks the queue backwards.
-///   5. After the last required question is answered, "save" triggers the
+///   3. "next" / Next advances; branching (`triggersQuestionIds`) splices
+///      child questions into the queue after the current position.
+///      "previous" / Back walks the queue backwards.
+///      "skip" / Skip is allowed only on optional (`!required`) questions.
+///   4. After the last required question is answered, "save" triggers the
 ///      LLM compose pass and saves the resulting PathologyReport.
 class GuidedReportScreen extends StatefulWidget {
-  final TemplateDocument template;
-  final TemplateSchema schema;
+  final List<TemplateDocument> templates;
+  final Map<String, TemplateSchema> schemas;
+  final String defaultTemplateId;
   final ValueChanged<PathologyReport>? onReportSaved;
   final VoidCallback? onBack;
 
   const GuidedReportScreen({
     super.key,
-    required this.template,
-    required this.schema,
+    required this.templates,
+    required this.schemas,
+    required this.defaultTemplateId,
     this.onReportSaved,
     this.onBack,
   });
@@ -45,10 +51,17 @@ class GuidedReportScreen extends StatefulWidget {
   State<GuidedReportScreen> createState() => _GuidedReportScreenState();
 }
 
+
 class _GuidedReportScreenState extends State<GuidedReportScreen>
     with TickerProviderStateMixin {
   final AudioService _audio = AudioService();
   final VoiceCommandService _voice = VoiceCommandService.instance;
+
+  // Step 0 — template selection.
+  // `_pickedTemplate` / `_pickedSchema` are null until the doctor (or the
+  // auto-pick path for a single-template lab) chooses one.
+  TemplateDocument? _pickedTemplate;
+  TemplateSchema? _pickedSchema;
 
   // Patient context
   String _confirmedPatientId = '';
@@ -56,12 +69,13 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
   bool _patientIdConfirmed = false;
 
   // Question queue (flat across sections, in order, with branched children
-  // inserted just-in-time when an answer with triggers is picked).
-  late List<TemplateQuestion> _queue;
+  // inserted just-in-time when an answer with triggers is picked). Empty
+  // until a template is picked.
+  List<TemplateQuestion> _queue = const [];
   int _cursor = 0;
   // Section title shown above the question — derived from where the question
   // originally sat in the schema.
-  late Map<String, String> _questionToSection;
+  Map<String, String> _questionToSection = const {};
 
   // Captured answers: questionId -> dynamic (String, List<String>, num).
   final Map<String, dynamic> _answers = <String, dynamic>{};
@@ -77,8 +91,7 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
   bool _recording = false;
   Duration _recordingDuration = Duration.zero;
 
-  String _statusMessage =
-      'Say or type your patient ID to begin the guided wizard.';
+  String _statusMessage = '';
   bool _composing = false;
   bool _saved = false;
   PathologyReport? _composedReport;
@@ -97,29 +110,66 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
       duration: const Duration(milliseconds: 1100),
     )..repeat(reverse: true);
 
-    // Build the linear queue (top-level questions in document order). Branched
-    // children are inserted on demand as answers are picked.
-    _queue = [];
-    _questionToSection = {};
-    for (final s in widget.schema.sections) {
-      for (final q in s.questions) {
-        if (q.parentAnswerId.isEmpty) {
-          _queue.add(q);
-        }
-        _questionToSection[q.id] = s.title;
-      }
-    }
-    if (_queue.isEmpty) {
-      _statusMessage =
-          'Template has no top-level questions. Re-parse it from the Templates screen.';
-    }
-
     _cmdSub = _voice.commands.listen(_handleCommand);
     _transcriptSub = _voice.transcript.listen(_handleTranscript);
     _durationSub = _audio.durationStream.listen((d) {
       if (mounted) setState(() => _recordingDuration = d);
     });
     _voice.start();
+
+    // If only one template is available, auto-pick it — the picker step
+    // would just be busywork. Otherwise leave `_pickedTemplate` null so the
+    // picker UI renders; the doctor can speak a name OR say "confirm" /
+    // "next" to take the configured default ([defaultTemplateId]).
+    if (widget.templates.length == 1) {
+      _pick(widget.templates.first);
+    } else {
+      _statusMessage =
+          'Pick a template — say its name, tap one, or say "confirm" to use the default.';
+    }
+  }
+
+  /// Lock in a template choice and prepare the question queue. Idempotent:
+  /// callers can re-pick (e.g. tap a different template before patient ID
+  /// is confirmed) and we'll rebuild the queue. Once patient ID is
+  /// confirmed the picker is hidden, so re-pick can't accidentally clobber
+  /// in-progress answers.
+  void _pick(TemplateDocument t) {
+    final schema = widget.schemas[t.id];
+    if (schema == null) return;
+    setState(() {
+      _pickedTemplate = t;
+      _pickedSchema = schema;
+      _queue = [];
+      _questionToSection = {};
+      for (final s in schema.sections) {
+        for (final q in s.questions) {
+          if (q.parentAnswerId.isEmpty) _queue.add(q);
+          _questionToSection[q.id] = s.title;
+        }
+      }
+      _cursor = 0;
+      _answers.clear();
+      _textAnswers.clear();
+      if (_queue.isEmpty) {
+        _statusMessage =
+            'Template "${t.name}" has no top-level questions. Re-parse it from the Templates screen.';
+      } else {
+        _statusMessage = widget.templates.length == 1
+            ? 'Say or type your patient ID to begin.'
+            : '"${t.name}" selected — say or type your patient ID to continue.';
+      }
+    });
+  }
+
+  /// Pick the configured default template. Used when the doctor hits
+  /// confirm / next without naming a template.
+  void _pickDefault() {
+    final fallback = widget.templates.firstWhere(
+      (t) => t.id == widget.defaultTemplateId,
+      orElse: () => widget.templates.first,
+    );
+    _pick(fallback);
   }
 
   @override
@@ -134,6 +184,7 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
   }
 
   TemplateQuestion? get _currentQuestion {
+    if (_pickedTemplate == null) return null;
     if (!_patientIdConfirmed) return null;
     if (_queue.isEmpty) return null;
     if (_cursor < 0 || _cursor >= _queue.length) return null;
@@ -165,8 +216,47 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
         _livePartial = u.text;
       }
     });
-    // Try to match select answers from the latest transcript chunk.
-    if (u.isFinal) _maybeMatchAnswerFromTranscript(u.text);
+    if (u.isFinal) {
+      // During Step 0 (template picker) try to match the spoken text against
+      // a template name so the doctor can say "use breast template" without
+      // tapping. Otherwise route to per-question answer matching.
+      if (_pickedTemplate == null) {
+        _maybeMatchTemplateFromTranscript(u.text);
+      } else {
+        _maybeMatchAnswerFromTranscript(u.text);
+      }
+    }
+  }
+
+  /// Match the spoken text against the available template names. Reuses the
+  /// same token-overlap fuzzy matcher used for answer choices, so phrases
+  /// like "use the breast template" or "colon resection" match cleanly.
+  void _maybeMatchTemplateFromTranscript(String text) {
+    if (widget.templates.length <= 1) return;
+    final tokens = _tokens(text);
+    if (tokens.isEmpty) return;
+    TemplateDocument? best;
+    double bestScore = 0;
+    for (final t in widget.templates) {
+      final hay = '${t.name} ${t.label}';
+      final lower = hay.toLowerCase();
+      // Substring shortcut.
+      if (lower.contains(t.name.toLowerCase()) &&
+          text.toLowerCase().contains(t.name.toLowerCase())) {
+        _pick(t);
+        return;
+      }
+      final tplTokens = _tokens(hay);
+      if (tplTokens.isEmpty) continue;
+      final inter = tplTokens.where(tokens.contains).length;
+      final union = ({...tplTokens, ...tokens}).length;
+      final score = union == 0 ? 0.0 : inter / union;
+      if (score > bestScore) {
+        bestScore = score;
+        best = t;
+      }
+    }
+    if (best != null && bestScore >= 0.4) _pick(best);
   }
 
   void _maybeMatchAnswerFromTranscript(String text) {
@@ -256,6 +346,17 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
       return;
     }
 
+    // Step 0 — picker: confirm/next without naming a template falls back
+    // to the configured default. (Naming a template is handled by the
+    // transcript matcher, not as a discrete command.)
+    if (_pickedTemplate == null) {
+      if (e.command == VoiceCommand.confirm ||
+          e.command == VoiceCommand.next) {
+        _pickDefault();
+      }
+      return;
+    }
+
     if (!_patientIdConfirmed) {
       if (e.command == VoiceCommand.patientId && e.payload.isNotEmpty) {
         _patientIdCtrl.text = e.payload;
@@ -335,7 +436,7 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
   /// select), drop those children from the queue (and their answers) so the
   /// wizard reflects the new branch.
   void _maybeReshapeQueue(TemplateQuestion q, TemplateAnswer picked) {
-    final allQs = widget.schema.allQuestions;
+    final allQs = _pickedSchema!.allQuestions;
 
     // For single-select, remove children of *other* answers of this question
     // first (since picking a new answer invalidates the old branch).
@@ -506,13 +607,13 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
     });
     try {
       final labels = <String, String>{};
-      for (final q in widget.schema.allQuestions) {
+      for (final q in _pickedSchema!.allQuestions) {
         labels[q.id] = q.label;
       }
       final composed = await OpenAIService.composeSynopticReport(
         answers: _answers,
         questionLabels: labels,
-        templateName: widget.template.name,
+        templateName: _pickedTemplate!.name,
       );
       final reportNumber = HiveStorageService.nextReportNumber();
       final existing = HiveStorageService.getPatient(_confirmedPatientId);
@@ -536,7 +637,7 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
         summary: composed['summary'] ?? '',
         rawTranscript: '',
         synopticAnswers: Map<String, dynamic>.from(_answers),
-        templateId: widget.template.id,
+        templateId: _pickedTemplate!.id,
         status: ReportStatus.pending,
         reportedDate: DateTime.now(),
         pathologistName: SettingsService.getPathologistName(),
@@ -631,11 +732,17 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text('Guided Report — ${widget.template.name}',
-                    style: Theme.of(context).textTheme.titleLarge,
-                    overflow: TextOverflow.ellipsis),
                 Text(
-                  '${widget.schema.sections.length} sections · ${widget.schema.totalQuestions} questions · v${widget.schema.version.isEmpty ? "—" : widget.schema.version}',
+                  _pickedTemplate == null
+                      ? 'Guided Report — choose a template'
+                      : 'Guided Report — ${_pickedTemplate!.name}',
+                  style: Theme.of(context).textTheme.titleLarge,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                Text(
+                  _pickedSchema == null
+                      ? '${widget.templates.length} templates available'
+                      : '${_pickedSchema!.sections.length} sections · ${_pickedSchema!.totalQuestions} questions · v${_pickedSchema!.version.isEmpty ? "—" : _pickedSchema!.version}',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ],
@@ -694,10 +801,137 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
   }
 
   Widget _leftPanel() {
+    if (_pickedTemplate == null) return _templatePickerCard();
     if (!_patientIdConfirmed) return _patientIdCard();
     if (_saved) return _savedCard();
     if (_queue.isEmpty) return _emptyCard();
     return _questionCard();
+  }
+
+  Widget _templatePickerCard() {
+    final defaultTpl = widget.templates.firstWhere(
+      (t) => t.id == widget.defaultTemplateId,
+      orElse: () => widget.templates.first,
+    );
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: Container(
+        padding: const EdgeInsets.all(28),
+        decoration: BoxDecoration(
+          color: AppColors.surface,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: AppColors.border),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: const [
+                Icon(Icons.fact_check_outlined,
+                    size: 20, color: AppColors.primary),
+                SizedBox(width: 8),
+                Text('Step 0 — Choose template',
+                    style: TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.w800)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(_statusMessage,
+                style: Theme.of(context).textTheme.bodyMedium),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 14, vertical: 12),
+              decoration: BoxDecoration(
+                color: AppColors.primary.withOpacity(0.06),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                    color: AppColors.primary.withOpacity(0.3)),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.star_rounded,
+                      size: 18, color: AppColors.warning),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Default',
+                            style: TextStyle(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: 0.5,
+                                color: AppColors.textHint)),
+                        Text(defaultTpl.name,
+                            style: const TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w700)),
+                        if (defaultTpl.label.isNotEmpty)
+                          Text(defaultTpl.label,
+                              style:
+                                  Theme.of(context).textTheme.bodySmall),
+                      ],
+                    ),
+                  ),
+                  FilledButton.icon(
+                    onPressed: () => _pick(defaultTpl),
+                    icon: const Icon(Icons.check_rounded, size: 16),
+                    label: const Text('Use default'),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Text('Or pick another:',
+                style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.5,
+                    color: AppColors.textHint)),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: widget.templates.map((t) {
+                final isDefault = t.id == defaultTpl.id;
+                return ActionChip(
+                  avatar: Icon(
+                    isDefault
+                        ? Icons.star_rounded
+                        : Icons.description_outlined,
+                    size: 14,
+                    color: isDefault
+                        ? AppColors.warning
+                        : AppColors.textSecondary,
+                  ),
+                  label: Text(
+                      t.label.isEmpty ? t.name : '${t.name} · ${t.label}',
+                      style: const TextStyle(fontSize: 12)),
+                  onPressed: () => _pick(t),
+                );
+              }).toList(),
+            ),
+            if (_liveFinal.isNotEmpty || _livePartial.isNotEmpty) ...[
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: AppColors.surfaceVariant,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  'Heard: "${(_liveFinal + ' ' + _livePartial).trim()}"',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
   }
 
   Widget _patientIdCard() {
@@ -806,6 +1040,10 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
     final q = _currentQuestion!;
     final sectionTitle = _questionToSection[q.id] ?? '';
     final answer = _answers[q.id];
+    // Optional questions get a subtle visual cue (dashed-style left accent)
+    // so the doctor immediately knows the question is safe to skip.
+    final accentColor =
+        q.required ? AppColors.primary : AppColors.textHint;
     return Padding(
       padding: const EdgeInsets.all(20),
       child: Container(
@@ -813,7 +1051,12 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
         decoration: BoxDecoration(
           color: AppColors.surface,
           borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: AppColors.border),
+          border: Border(
+            top: const BorderSide(color: AppColors.border),
+            right: const BorderSide(color: AppColors.border),
+            bottom: const BorderSide(color: AppColors.border),
+            left: BorderSide(color: accentColor, width: 4),
+          ),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -841,9 +1084,14 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
               runSpacing: 4,
               children: [
                 _typeChip(q),
-                if (!q.required) _smallChip('Optional', AppColors.textHint),
+                if (q.required)
+                  _smallChip('Required', AppColors.error)
+                else
+                  _smallChip('Optional · safe to skip', AppColors.textHint),
                 if (q.units.isNotEmpty)
                   _smallChip('Units: ${q.units}', AppColors.info),
+                if (q.freeTextAllowed)
+                  _smallChip('+ free text allowed', AppColors.info),
               ],
             ),
             const SizedBox(height: 16),
@@ -1158,6 +1406,9 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
   }
 
   Widget _rightPanel() {
+    // Until a template is picked, the right panel acts as a guidance card —
+    // the doctor sees what each template will ask before committing.
+    if (_pickedTemplate == null) return _templateOverviewPanel();
     return Padding(
       padding: const EdgeInsets.all(20),
       child: Container(
@@ -1180,6 +1431,8 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
                         fontSize: 14, fontWeight: FontWeight.w800)),
               ],
             ),
+            const SizedBox(height: 8),
+            _requiredProgressBar(),
             const SizedBox(height: 8),
             Expanded(child: _previewBody()),
             if (_allRequiredAnswered) ...[
@@ -1246,6 +1499,184 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
     );
   }
 
+  /// Right-side panel shown during Step 0 — gives the doctor a preview of
+  /// what each template covers (sections + question/required counts) so they
+  /// can choose informed.
+  Widget _templateOverviewPanel() {
+    return Padding(
+      padding: const EdgeInsets.all(20),
+      child: Container(
+        decoration: BoxDecoration(
+          color: AppColors.surface,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: AppColors.border),
+        ),
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: const [
+                Icon(Icons.library_books_outlined,
+                    size: 16, color: AppColors.primary),
+                SizedBox(width: 6),
+                Text('Available templates',
+                    style: TextStyle(
+                        fontSize: 14, fontWeight: FontWeight.w800)),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Each template has its own set of required and optional fields. Required fields must be answered to save; optional fields can be skipped.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: ListView.separated(
+                itemCount: widget.templates.length,
+                separatorBuilder: (_, __) => const SizedBox(height: 8),
+                itemBuilder: (_, i) {
+                  final t = widget.templates[i];
+                  final s = widget.schemas[t.id]!;
+                  final isDefault = t.id == widget.defaultTemplateId;
+                  final required =
+                      s.allQuestions.where((q) => q.required).length;
+                  final optional = s.totalQuestions - required;
+                  return InkWell(
+                    onTap: () => _pick(t),
+                    borderRadius: BorderRadius.circular(10),
+                    child: Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: AppColors.surfaceVariant,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: isDefault
+                              ? AppColors.primary.withOpacity(0.4)
+                              : AppColors.border,
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(t.name,
+                                    style: const TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w700)),
+                              ),
+                              if (isDefault)
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 6, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color:
+                                        AppColors.warning.withOpacity(0.15),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: const Text('DEFAULT',
+                                      style: TextStyle(
+                                          fontSize: 9,
+                                          fontWeight: FontWeight.w800,
+                                          color: AppColors.warning)),
+                                ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 4,
+                            children: [
+                              _miniChip('${s.sections.length} sec',
+                                  AppColors.info),
+                              _miniChip('$required required',
+                                  AppColors.error),
+                              if (optional > 0)
+                                _miniChip(
+                                    '$optional optional', AppColors.textHint),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _miniChip(String s, Color c) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: c.withOpacity(0.10),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(s,
+          style: TextStyle(
+              fontSize: 9, fontWeight: FontWeight.w700, color: c)),
+    );
+  }
+
+  /// Required-only progress bar shown above the synoptic preview so the
+  /// doctor sees how many *mandatory* fields are still outstanding —
+  /// optional fields are intentionally excluded so the bar doesn't punish
+  /// them for skipping safely-skippable items.
+  Widget _requiredProgressBar() {
+    if (_queue.isEmpty) return const SizedBox.shrink();
+    final required = _queue.where((q) => q.required).toList();
+    if (required.isEmpty) {
+      return Text('No required fields in this branch.',
+          style: Theme.of(context).textTheme.bodySmall);
+    }
+    final answered = required.where((q) {
+      final v = _answers[q.id];
+      if (v == null) return false;
+      if (v is String && v.trim().isEmpty) return false;
+      if (v is List && v.isEmpty) return false;
+      return true;
+    }).length;
+    final pct = answered / required.length;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Required progress',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.4,
+                    color: AppColors.textHint),
+              ),
+            ),
+            Text('$answered / ${required.length}',
+                style: const TextStyle(
+                    fontSize: 11, fontWeight: FontWeight.w700)),
+          ],
+        ),
+        const SizedBox(height: 4),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: LinearProgressIndicator(
+            value: pct,
+            minHeight: 6,
+            backgroundColor: AppColors.surfaceVariant,
+            valueColor: AlwaysStoppedAnimation<Color>(
+                pct >= 1 ? AppColors.success : AppColors.primary),
+          ),
+        ),
+      ],
+    );
+  }
+
   String _formatAnswer(TemplateQuestion q, dynamic v) {
     if (v == null) return '—';
     if (v is List) return v.join(', ');
@@ -1261,7 +1692,19 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
     String first(VoiceCommand c) =>
         (phrases[c.key] ?? '').split('|').first.trim();
     final hints = <String>[];
-    if (!_patientIdConfirmed) {
+    if (_pickedTemplate == null) {
+      // Step 0 — picker. Show that they can speak a template name OR confirm
+      // for the default. The actual template-name match happens in
+      // _maybeMatchTemplateFromTranscript.
+      if (widget.templates.length > 1) {
+        final t = widget.templates.firstWhere(
+          (t) => t.id != widget.defaultTemplateId,
+          orElse: () => widget.templates.first,
+        );
+        hints.add('"use ${t.name.toLowerCase()}"');
+      }
+      hints.add('"${first(VoiceCommand.confirm)}" (use default)');
+    } else if (!_patientIdConfirmed) {
       hints.add('"${first(VoiceCommand.patientId)} 12345"');
       hints.add('"${first(VoiceCommand.confirm)}"');
     } else if (_saved) {
@@ -1270,7 +1713,7 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
       hints.addAll([
         '"${first(VoiceCommand.next)}"',
         '"${first(VoiceCommand.previous)}"',
-        '"${first(VoiceCommand.skip)}"',
+        '"${first(VoiceCommand.skip)}" (optional only)',
         '"${first(VoiceCommand.start)}"',
         '"${first(VoiceCommand.stop)}"',
         '"${first(VoiceCommand.save)}"',
