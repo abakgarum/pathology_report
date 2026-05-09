@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  pathology_report — desktop app icon source.
+  Master canvas: 1024x1024. Render to PNG with `tools/setup_icon.sh`,
+  which then drives flutter_launcher_icons to populate every platform's
+  AppIcon set.
+
+  Design read: a tilted clinical document with a highlighted DIAGNOSIS
+  rule (matching the in-app diagnosis-first headline block) and a
+  histology slide stripe at the bottom carrying H&E-coloured cell
+  clusters — instantly readable as "pathology report" at any size from
+  16px upward.
+
+  Colours:
+    Background   — primary teal gradient #14A3A8 → #0D7377 (matches AppColors.primary).
+    Slide        — #FBE9EC (faint H&E pink), #9E1B2C / #C4253A / #7A0F1D for cell nuclei.
+    Document     — pure white, #E8EEF1 fold, #0D7377 accents.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#14A3A8"/>
+      <stop offset="100%" stop-color="#0D7377"/>
+    </linearGradient>
+    <filter id="docShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
+      <feOffset dx="0" dy="14" result="off"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.35"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Rounded square background (macOS app-icon corner radius ≈ 22% of edge) -->
+  <rect width="1024" height="1024" rx="220" ry="220" fill="url(#bgGrad)"/>
+
+  <!-- Subtle inner highlight ring -->
+  <rect x="40" y="40" width="944" height="944" rx="190" ry="190"
+        fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="2"/>
+
+  <!-- Document, slightly tilted for life -->
+  <g transform="rotate(-4 512 512)" filter="url(#docShadow)">
+    <!-- Body -->
+    <rect x="232" y="220" width="560" height="600" rx="32" ry="32" fill="#FFFFFF"/>
+    <!-- Folded corner -->
+    <path d="M 680 220 L 792 332 L 680 332 Z" fill="#E8EEF1"/>
+    <path d="M 680 220 L 680 332 L 792 332"
+          fill="none" stroke="#0D7377" stroke-opacity="0.35" stroke-width="3"/>
+
+    <!-- Title bar (HISTOPATHOLOGY REPORT) -->
+    <rect x="280" y="278" width="280" height="22" rx="11" fill="#0D7377"/>
+    <rect x="280" y="320" width="380" height="12" rx="6" fill="#D8E1E5"/>
+    <rect x="280" y="346" width="320" height="12" rx="6" fill="#D8E1E5"/>
+
+    <!-- DIAGNOSIS headline block — left rule + bold body, mirrors the in-app block -->
+    <rect x="270" y="412" width="6" height="80" rx="3" fill="#0D7377"/>
+    <rect x="290" y="412" width="220" height="16" rx="8" fill="#0D7377"/>
+    <rect x="290" y="442" width="430" height="14" rx="7" fill="#1A2B3C"/>
+    <rect x="290" y="468" width="370" height="14" rx="7" fill="#1A2B3C"/>
+
+    <!-- Histology slide -->
+    <rect x="280" y="540" width="464" height="200" rx="12" fill="#FBE9EC"/>
+    <rect x="280" y="540" width="464" height="6" rx="3" fill="#0D7377" fill-opacity="0.25"/>
+
+    <!-- Cell clusters (H&E nuclei) -->
+    <g>
+      <circle cx="370" cy="608" r="22" fill="#9E1B2C" fill-opacity="0.85"/>
+      <circle cx="436" cy="638" r="17" fill="#C4253A" fill-opacity="0.85"/>
+      <circle cx="510" cy="610" r="20" fill="#9E1B2C" fill-opacity="0.85"/>
+      <circle cx="582" cy="650" r="15" fill="#C4253A" fill-opacity="0.85"/>
+      <circle cx="650" cy="618" r="18" fill="#7A0F1D" fill-opacity="0.85"/>
+      <circle cx="488" cy="678" r="13" fill="#7A0F1D" fill-opacity="0.85"/>
+      <circle cx="402" cy="688" r="11" fill="#9E1B2C" fill-opacity="0.85"/>
+      <circle cx="618" cy="690" r="14" fill="#9E1B2C" fill-opacity="0.85"/>
+    </g>
+
+    <!-- Lab number stripe -->
+    <rect x="280" y="772" width="190" height="14" rx="7" fill="#1A2B3C"/>
+    <rect x="488" y="772" width="100" height="14" rx="7" fill="#0D7377"/>
+  </g>
+</svg>

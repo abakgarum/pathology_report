@@ -147,6 +147,22 @@ class PathologyReport {
   String grossExamination;
   String microscopyImpression;
 
+  // Diagnosis-first headline. Pathologists read the bottom-line diagnosis
+  // BEFORE the supporting evidence — so this 1-3 sentence statement is
+  // rendered prominently at the top of the report (after Clinical
+  // Information). Examples:
+  //   "Residual invasive ductal carcinoma — right breast. Lymph nodes:
+  //    2 of 14 show metastatic carcinoma without extracapsular extension.
+  //    All surgical resection margins are free of tumour."
+  // Optional — empty string means "use microscopyImpression as the
+  // headline" for backward compatibility with old reports.
+  String diagnosisHeadline;
+
+  // Pathological staging string (pTNM / ypTNM, AJCC edition implied).
+  // Examples: "ypT1cN1a", "pT2N0M0", "pT3aN2bM0".
+  // Optional — empty string means "no staging captured".
+  String pathologicStaging;
+
   // Draft / raw content
   String rawTranscript;
   List<VoiceRecording> voiceRecordings;
@@ -164,6 +180,10 @@ class PathologyReport {
   DateTime reportedDate;
   String pathologistName;
   String pathologistRegistration;
+  // Dual-signature fields — populated only when the lab has dual sign-out
+  // enabled in Settings. Empty strings mean "single signatory".
+  String pathologistName2;
+  String pathologistRegistration2;
 
   PathologyReport({
     String? id,
@@ -182,6 +202,8 @@ class PathologyReport {
     this.specimen = '',
     this.grossExamination = '',
     this.microscopyImpression = '',
+    this.diagnosisHeadline = '',
+    this.pathologicStaging = '',
     this.rawTranscript = '',
     List<VoiceRecording>? voiceRecordings,
     this.summary = '',
@@ -194,6 +216,8 @@ class PathologyReport {
     DateTime? reportedDate,
     this.pathologistName = 'Dr. Komal D. Chippalkatti',
     this.pathologistRegistration = 'KMC - 79367',
+    this.pathologistName2 = '',
+    this.pathologistRegistration2 = '',
   })  : id = id ?? const Uuid().v4(),
         // Default the QR UUID to a fresh v4. Caller can override for legacy reads.
         reportUuid = reportUuid ?? const Uuid().v4(),
@@ -220,6 +244,8 @@ class PathologyReport {
     String? specimen,
     String? grossExamination,
     String? microscopyImpression,
+    String? diagnosisHeadline,
+    String? pathologicStaging,
     String? rawTranscript,
     List<VoiceRecording>? voiceRecordings,
     String? summary,
@@ -230,6 +256,8 @@ class PathologyReport {
     DateTime? reportedDate,
     String? pathologistName,
     String? pathologistRegistration,
+    String? pathologistName2,
+    String? pathologistRegistration2,
   }) {
     return PathologyReport(
       id: id,
@@ -248,6 +276,8 @@ class PathologyReport {
       specimen: specimen ?? this.specimen,
       grossExamination: grossExamination ?? this.grossExamination,
       microscopyImpression: microscopyImpression ?? this.microscopyImpression,
+      diagnosisHeadline: diagnosisHeadline ?? this.diagnosisHeadline,
+      pathologicStaging: pathologicStaging ?? this.pathologicStaging,
       rawTranscript: rawTranscript ?? this.rawTranscript,
       voiceRecordings: voiceRecordings ?? this.voiceRecordings,
       summary: summary ?? this.summary,
@@ -261,6 +291,9 @@ class PathologyReport {
       pathologistName: pathologistName ?? this.pathologistName,
       pathologistRegistration:
           pathologistRegistration ?? this.pathologistRegistration,
+      pathologistName2: pathologistName2 ?? this.pathologistName2,
+      pathologistRegistration2:
+          pathologistRegistration2 ?? this.pathologistRegistration2,
     );
   }
 }
@@ -583,11 +616,19 @@ class PathologyReportAdapter extends TypeAdapter<PathologyReport> {
     String reportUuid = id;
     Map<String, dynamic> synopticAnswers = <String, dynamic>{};
     String templateId = '';
+    String pathologistName2 = '';
+    String pathologistRegistration2 = '';
+    String diagnosisHeadline = '';
+    String pathologicStaging = '';
     if (reader.availableBytes > 0) reportUuid = reader.readString();
     if (reader.availableBytes > 0) {
       synopticAnswers = Map<String, dynamic>.from(reader.readMap());
     }
     if (reader.availableBytes > 0) templateId = reader.readString();
+    if (reader.availableBytes > 0) pathologistName2 = reader.readString();
+    if (reader.availableBytes > 0) pathologistRegistration2 = reader.readString();
+    if (reader.availableBytes > 0) diagnosisHeadline = reader.readString();
+    if (reader.availableBytes > 0) pathologicStaging = reader.readString();
 
     return PathologyReport(
       id: id,
@@ -618,6 +659,10 @@ class PathologyReportAdapter extends TypeAdapter<PathologyReport> {
       reportedDate: reportedDate,
       pathologistName: pathologistName,
       pathologistRegistration: pathologistRegistration,
+      pathologistName2: pathologistName2,
+      pathologistRegistration2: pathologistRegistration2,
+      diagnosisHeadline: diagnosisHeadline,
+      pathologicStaging: pathologicStaging,
     );
   }
 
@@ -652,6 +697,10 @@ class PathologyReportAdapter extends TypeAdapter<PathologyReport> {
     writer.writeString(obj.reportUuid);
     writer.writeMap(obj.synopticAnswers);
     writer.writeString(obj.templateId);
+    writer.writeString(obj.pathologistName2);
+    writer.writeString(obj.pathologistRegistration2);
+    writer.writeString(obj.diagnosisHeadline);
+    writer.writeString(obj.pathologicStaging);
   }
 }
 

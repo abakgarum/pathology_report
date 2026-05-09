@@ -9,6 +9,7 @@ import '../services/settings_service.dart';
 import '../services/voice_command_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/voice_debug_panel.dart';
+import '../widgets/voice_unavailable_banner.dart';
 
 /// Always-listening landing screen. Spoken commands navigate to:
 ///   - "new report"  → [onNewReport]
@@ -100,6 +101,12 @@ class _HomeVoiceScreenState extends State<HomeVoiceScreen>
         child: Column(
           children: [
             _header(),
+            // When STT is unavailable on this Mac, the central mic
+            // animation would otherwise pulse forever waiting for input
+            // that can't arrive. The banner gives the doctor a clear
+            // reason + Retry, and the rest of the home page (stats, side
+            // nav, tap-to-open buttons) keeps working as a normal app.
+            const VoiceUnavailableBanner(),
             const SizedBox(height: 16),
             _stats(),
             const SizedBox(height: 20),

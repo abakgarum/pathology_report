@@ -115,8 +115,12 @@ class _BrandingTabState extends State<_BrandingTab> {
   late TextEditingController _pathologistName;
   late TextEditingController _pathologistReg;
   late TextEditingController _pathologistTitle;
+  late TextEditingController _pathologist2Name;
+  late TextEditingController _pathologist2Reg;
+  late TextEditingController _pathologist2Title;
   late TextEditingController _watermarkText;
   bool _printBarcode = false;
+  bool _dualSignature = false;
   String _logoPath = '';
   Timer? _debounce;
 
@@ -138,9 +142,16 @@ class _BrandingTabState extends State<_BrandingTab> {
         text: SettingsService.getPathologistRegistration());
     _pathologistTitle =
         TextEditingController(text: SettingsService.getPathologistTitle());
+    _pathologist2Name =
+        TextEditingController(text: SettingsService.getPathologist2Name());
+    _pathologist2Reg = TextEditingController(
+        text: SettingsService.getPathologist2Registration());
+    _pathologist2Title =
+        TextEditingController(text: SettingsService.getPathologist2Title());
     _watermarkText =
         TextEditingController(text: SettingsService.getPdfWatermarkText());
     _printBarcode = SettingsService.getPrintLinearBarcode();
+    _dualSignature = SettingsService.getDualSignatureEnabled();
     _logoPath = SettingsService.getClinicLogoPath();
   }
 
@@ -155,6 +166,9 @@ class _BrandingTabState extends State<_BrandingTab> {
     _pathologistName.dispose();
     _pathologistReg.dispose();
     _pathologistTitle.dispose();
+    _pathologist2Name.dispose();
+    _pathologist2Reg.dispose();
+    _pathologist2Title.dispose();
     _watermarkText.dispose();
     super.dispose();
   }
@@ -174,6 +188,11 @@ class _BrandingTabState extends State<_BrandingTab> {
     await SettingsService.setPathologistRegistration(
         _pathologistReg.text.trim());
     await SettingsService.setPathologistTitle(_pathologistTitle.text.trim());
+    await SettingsService.setPathologist2Name(_pathologist2Name.text.trim());
+    await SettingsService.setPathologist2Registration(
+        _pathologist2Reg.text.trim());
+    await SettingsService.setPathologist2Title(_pathologist2Title.text.trim());
+    await SettingsService.setDualSignatureEnabled(_dualSignature);
     await SettingsService.setPdfWatermarkText(_watermarkText.text.trim());
     await SettingsService.setPrintLinearBarcode(_printBarcode);
   }
@@ -237,6 +256,42 @@ class _BrandingTabState extends State<_BrandingTab> {
             _field(_pathologistName, 'Name'),
             _field(_pathologistReg, 'Registration number'),
             _field(_pathologistTitle, 'Title / role'),
+          ],
+        ),
+        _section(
+          title: 'Admin · Dual sign-out',
+          subtitle:
+              'Some labs require two pathologists to co-sign every report (e.g. resident + consultant, or peer-review workflow). When enabled, both signature blocks are snapshotted onto every new report and printed side-by-side.',
+          children: [
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Enable dual signature on new reports'),
+              subtitle: Text(
+                  _dualSignature
+                      ? 'New reports will carry both pathologists\' signatures.'
+                      : 'Reports will be signed by the primary pathologist only.',
+                  style: Theme.of(context).textTheme.bodySmall),
+              value: _dualSignature,
+              onChanged: (v) {
+                setState(() => _dualSignature = v);
+                _scheduleSave();
+              },
+            ),
+            if (_dualSignature) ...[
+              const SizedBox(height: 8),
+              const Text('Second pathologist',
+                  style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 0.4)),
+              const SizedBox(height: 8),
+              _field(_pathologist2Name, 'Name',
+                  hint: 'e.g. Dr. Jane Smith'),
+              _field(_pathologist2Reg, 'Registration number',
+                  hint: 'e.g. KMC - 12345'),
+              _field(_pathologist2Title, 'Title / role',
+                  hint: 'e.g. Senior Resident, Histopathology'),
+            ],
           ],
         ),
         _section(

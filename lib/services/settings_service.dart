@@ -98,6 +98,14 @@ class SettingsService {
   static const String _watermarkTextKey = 'pdf_watermark_text';
   static const String _printLinearBarcodeKey = 'print_linear_barcode';
 
+  // Dual sign-out (admin-controlled). When enabled, every report is
+  // snapshotted with both pathologists' name + registration so the printed
+  // report carries two signature blocks side-by-side.
+  static const String _dualSignatureEnabledKey = 'dual_signature_enabled';
+  static const String _pathologist2NameKey = 'pathologist2_name';
+  static const String _pathologist2RegKey = 'pathologist2_registration';
+  static const String _pathologist2TitleKey = 'pathologist2_title';
+
   static Box get _box => Hive.box(_boxName);
 
   static Future<void> init() async {
@@ -259,6 +267,36 @@ class SettingsService {
       _box.get(_printLinearBarcodeKey, defaultValue: false);
   static Future<void> setPrintLinearBarcode(bool v) async {
     await _box.put(_printLinearBarcodeKey, v);
+    _notifier.value++;
+  }
+
+  // ─── Dual sign-out ───────────────────────────────────────────────────
+
+  static bool getDualSignatureEnabled() =>
+      _box.get(_dualSignatureEnabledKey, defaultValue: false);
+  static Future<void> setDualSignatureEnabled(bool v) async {
+    await _box.put(_dualSignatureEnabledKey, v);
+    _notifier.value++;
+  }
+
+  static String getPathologist2Name() =>
+      _box.get(_pathologist2NameKey, defaultValue: '');
+  static Future<void> setPathologist2Name(String v) async {
+    await _box.put(_pathologist2NameKey, v);
+    _notifier.value++;
+  }
+
+  static String getPathologist2Registration() =>
+      _box.get(_pathologist2RegKey, defaultValue: '');
+  static Future<void> setPathologist2Registration(String v) async {
+    await _box.put(_pathologist2RegKey, v);
+    _notifier.value++;
+  }
+
+  static String getPathologist2Title() =>
+      _box.get(_pathologist2TitleKey, defaultValue: '');
+  static Future<void> setPathologist2Title(String v) async {
+    await _box.put(_pathologist2TitleKey, v);
     _notifier.value++;
   }
 

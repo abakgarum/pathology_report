@@ -492,23 +492,37 @@ class _TemplateView extends StatelessWidget {
           ),
           const SizedBox(height: 14),
           _infoGrid(fmt),
-          const Divider(height: 26, thickness: 1),
+          const Divider(
+              height: 28,
+              thickness: 1.4,
+              color: AppColors.textPrimary),
           const Center(
             child: Text(
               'HISTOPATHOLOGY REPORT',
               style: TextStyle(
-                  fontSize: 13.5,
-                  fontWeight: FontWeight.w800,
-                  decoration: TextDecoration.underline),
+                  fontSize: 15,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0.5,
+                  color: AppColors.textPrimary,
+                  decoration: TextDecoration.underline,
+                  decorationThickness: 1.5),
             ),
           ),
           const SizedBox(height: 14),
           _inline('LAB NUMBER', r.reportNumber),
           const SizedBox(height: 10),
           _section('CLINICAL INFORMATION', r.clinicalInformation),
+          // Diagnosis-first ordering — the BOTTOM-LINE diagnosis sits at
+          // the TOP of the report (after Clinical Information). This is
+          // the convention every major lab uses: pathologists, treating
+          // clinicians, and tumour-board readers all want the dx first
+          // and the supporting evidence (Gross / Microscopy) below.
+          _diagnosisHeadlineBlock(),
+          if (r.pathologicStaging.trim().isNotEmpty)
+            _section('PATHOLOGIC STAGING', r.pathologicStaging),
           _section('SPECIMEN', r.specimen),
           _section('GROSS EXAMINATION', r.grossExamination),
-          _section('MICROSCOPY AND IMPRESSION', r.microscopyImpression),
+          _section('MICROSCOPY', r.microscopyImpression),
           const SizedBox(height: 16),
           Container(
             padding: const EdgeInsets.all(10),
@@ -529,21 +543,7 @@ class _TemplateView extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 32),
-          Align(
-            alignment: Alignment.centerRight,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                Text(r.pathologistName,
-                    style: const TextStyle(
-                        fontSize: 13, fontWeight: FontWeight.w700)),
-                Text(r.pathologistRegistration,
-                    style: const TextStyle(fontSize: 12)),
-                Text(SettingsService.getPathologistTitle(),
-                    style: const TextStyle(fontSize: 12)),
-              ],
-            ),
-          ),
+          _signatureBlock(),
         ],
       ),
     );
@@ -551,7 +551,7 @@ class _TemplateView extends StatelessWidget {
 
   Widget _infoGrid(DateFormat fmt) {
     Widget row(String l, String v) => Padding(
-          padding: const EdgeInsets.symmetric(vertical: 2),
+          padding: const EdgeInsets.symmetric(vertical: 3),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -559,12 +559,20 @@ class _TemplateView extends StatelessWidget {
                 width: 130,
                 child: Text(l,
                     style: const TextStyle(
-                        fontSize: 12, fontWeight: FontWeight.w600)),
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w700,
+                        color: AppColors.textPrimary)),
               ),
-              const Text(': ', style: TextStyle(fontSize: 12)),
+              const Text(': ',
+                  style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.textPrimary)),
               Expanded(
                 child: Text(v,
-                    style: const TextStyle(fontSize: 12),
+                    style: const TextStyle(
+                        fontSize: 12.5,
+                        color: AppColors.textPrimary),
                     overflow: TextOverflow.ellipsis),
               ),
             ],
@@ -610,11 +618,121 @@ class _TemplateView extends StatelessWidget {
         SizedBox(
           width: 130,
           child: Text(label,
-              style:
-                  const TextStyle(fontSize: 12, fontWeight: FontWeight.w800)),
+              style: const TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 0.3,
+                  color: AppColors.textPrimary)),
         ),
-        const Text(': '),
-        Expanded(child: Text(value, style: const TextStyle(fontSize: 12))),
+        const Text(': ',
+            style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w900,
+                color: AppColors.textPrimary)),
+        Expanded(
+            child: Text(value,
+                style: const TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.textPrimary))),
+      ],
+    );
+  }
+
+  /// Diagnosis-first headline block. Falls back to the `summary` field
+  /// (which existed before we introduced `diagnosisHeadline`) so old
+  /// reports still get a meaningful top-of-page statement. If neither
+  /// is present, renders nothing — the renderer collapses gracefully.
+  Widget _diagnosisHeadlineBlock() {
+    final body = r.diagnosisHeadline.trim().isNotEmpty
+        ? r.diagnosisHeadline.trim()
+        : r.summary.trim();
+    if (body.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+        decoration: BoxDecoration(
+          color: AppColors.primary.withValues(alpha: 0.05),
+          borderRadius: BorderRadius.circular(6),
+          border: Border(
+            left: BorderSide(color: AppColors.primary, width: 4),
+            top: BorderSide(color: AppColors.border),
+            right: BorderSide(color: AppColors.border),
+            bottom: BorderSide(color: AppColors.border),
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'HISTOPATHOLOGY DIAGNOSIS',
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 0.6,
+                color: AppColors.primary,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              body,
+              style: const TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                height: 1.45,
+                color: AppColors.textPrimary,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Signature block at the bottom of the on-screen report. If the report
+  /// was saved while dual sign-out was enabled (i.e. `pathologistName2` is
+  /// non-empty) we render two signatory columns; otherwise just the primary.
+  Widget _signatureBlock() {
+    final title1 = SettingsService.getPathologistTitle();
+    final title2 = SettingsService.getPathologist2Title();
+    final hasSecond = r.pathologistName2.trim().isNotEmpty;
+
+    Widget signatory(String name, String reg, String title,
+        {required CrossAxisAlignment align}) {
+      return Column(
+        crossAxisAlignment: align,
+        children: [
+          Text(name,
+              style: const TextStyle(
+                  fontSize: 13, fontWeight: FontWeight.w700)),
+          Text(reg, style: const TextStyle(fontSize: 12)),
+          Text(title, style: const TextStyle(fontSize: 12)),
+        ],
+      );
+    }
+
+    if (!hasSecond) {
+      return Align(
+        alignment: Alignment.centerRight,
+        child: signatory(r.pathologistName, r.pathologistRegistration, title1,
+            align: CrossAxisAlignment.end),
+      );
+    }
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(
+          child: signatory(
+              r.pathologistName2, r.pathologistRegistration2, title2,
+              align: CrossAxisAlignment.start),
+        ),
+        const SizedBox(width: 24),
+        Expanded(
+          child: signatory(
+              r.pathologistName, r.pathologistRegistration, title1,
+              align: CrossAxisAlignment.end),
+        ),
       ],
     );
   }
@@ -622,7 +740,7 @@ class _TemplateView extends StatelessWidget {
   Widget _section(String label, String body) {
     if (body.trim().isEmpty) return const SizedBox.shrink();
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
+      padding: const EdgeInsets.symmetric(vertical: 8),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -630,12 +748,22 @@ class _TemplateView extends StatelessWidget {
             width: 210,
             child: Text(label,
                 style: const TextStyle(
-                    fontSize: 12, fontWeight: FontWeight.w800)),
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 0.4,
+                    color: AppColors.textPrimary)),
           ),
-          const Text(': '),
+          const Text(': ',
+              style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w900,
+                  color: AppColors.textPrimary)),
           Expanded(
             child: Text(body,
-                style: const TextStyle(fontSize: 12, height: 1.4)),
+                style: const TextStyle(
+                    fontSize: 12.5,
+                    height: 1.5,
+                    color: AppColors.textPrimary)),
           ),
         ],
       ),
@@ -668,7 +796,7 @@ Future<Uint8List> _buildPdfBytes(PathologyReport r) async {
   }
 
   pw.Widget row(String l, String v) => pw.Padding(
-        padding: const pw.EdgeInsets.symmetric(vertical: 1.5),
+        padding: const pw.EdgeInsets.symmetric(vertical: 2),
         child: pw.Row(
           crossAxisAlignment: pw.CrossAxisAlignment.start,
           children: [
@@ -676,10 +804,14 @@ Future<Uint8List> _buildPdfBytes(PathologyReport r) async {
               width: 110,
               child: pw.Text(l,
                   style: pw.TextStyle(
-                      fontSize: 10, fontWeight: pw.FontWeight.bold)),
+                      fontSize: 10.5, fontWeight: pw.FontWeight.bold)),
             ),
-            pw.Text(': ', style: const pw.TextStyle(fontSize: 10)),
-            pw.Expanded(child: pw.Text(v, style: const pw.TextStyle(fontSize: 10))),
+            pw.Text(': ',
+                style: pw.TextStyle(
+                    fontSize: 10.5, fontWeight: pw.FontWeight.bold)),
+            pw.Expanded(
+                child: pw.Text(v,
+                    style: const pw.TextStyle(fontSize: 10.5))),
           ],
         ),
       );
@@ -687,7 +819,7 @@ Future<Uint8List> _buildPdfBytes(PathologyReport r) async {
   pw.Widget sect(String label, String body) {
     if (body.trim().isEmpty) return pw.SizedBox();
     return pw.Padding(
-      padding: const pw.EdgeInsets.symmetric(vertical: 4),
+      padding: const pw.EdgeInsets.symmetric(vertical: 5),
       child: pw.Row(
         crossAxisAlignment: pw.CrossAxisAlignment.start,
         children: [
@@ -695,14 +827,59 @@ Future<Uint8List> _buildPdfBytes(PathologyReport r) async {
             width: 190,
             child: pw.Text(label,
                 style: pw.TextStyle(
-                    fontSize: 10, fontWeight: pw.FontWeight.bold)),
+                    fontSize: 10.5,
+                    fontWeight: pw.FontWeight.bold,
+                    letterSpacing: 0.3)),
           ),
-          pw.Text(': ', style: const pw.TextStyle(fontSize: 10)),
+          pw.Text(': ',
+              style: pw.TextStyle(
+                  fontSize: 10.5, fontWeight: pw.FontWeight.bold)),
           pw.Expanded(
             child: pw.Text(body,
-                style: const pw.TextStyle(fontSize: 10, lineSpacing: 2)),
+                style: const pw.TextStyle(fontSize: 10.5, lineSpacing: 2.5)),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Diagnosis-first headline block in the PDF — tinted box with a
+  /// coloured left rule, mirroring the on-screen renderer.
+  pw.Widget diagnosisBlock() {
+    final body = r.diagnosisHeadline.trim().isNotEmpty
+        ? r.diagnosisHeadline.trim()
+        : r.summary.trim();
+    if (body.isEmpty) return pw.SizedBox();
+    return pw.Padding(
+      padding: const pw.EdgeInsets.symmetric(vertical: 6),
+      child: pw.Container(
+        padding: const pw.EdgeInsets.fromLTRB(10, 8, 10, 8),
+        decoration: pw.BoxDecoration(
+          color: PdfColor.fromInt(0xFFEFF6FB),
+          border: pw.Border(
+            left: pw.BorderSide(width: 3, color: PdfColors.blueGrey700),
+            top: pw.BorderSide(width: 0.5, color: PdfColors.grey400),
+            right: pw.BorderSide(width: 0.5, color: PdfColors.grey400),
+            bottom: pw.BorderSide(width: 0.5, color: PdfColors.grey400),
+          ),
+        ),
+        child: pw.Column(
+          crossAxisAlignment: pw.CrossAxisAlignment.start,
+          children: [
+            pw.Text('HISTOPATHOLOGY DIAGNOSIS',
+                style: pw.TextStyle(
+                    fontSize: 10,
+                    fontWeight: pw.FontWeight.bold,
+                    letterSpacing: 0.5,
+                    color: PdfColors.blueGrey800)),
+            pw.SizedBox(height: 4),
+            pw.Text(body,
+                style: pw.TextStyle(
+                    fontSize: 11,
+                    fontWeight: pw.FontWeight.bold,
+                    lineSpacing: 3)),
+          ],
+        ),
       ),
     );
   }
@@ -842,12 +1019,13 @@ Future<Uint8List> _buildPdfBytes(PathologyReport r) async {
             ),
           ],
         ),
-        pw.Divider(thickness: 1),
+        pw.Divider(thickness: 1.2),
         pw.Center(
           child: pw.Text('HISTOPATHOLOGY REPORT',
               style: pw.TextStyle(
-                  fontSize: 12,
+                  fontSize: 13,
                   fontWeight: pw.FontWeight.bold,
+                  letterSpacing: 0.5,
                   decoration: pw.TextDecoration.underline)),
         ),
         pw.SizedBox(height: 10),
@@ -858,19 +1036,29 @@ Future<Uint8List> _buildPdfBytes(PathologyReport r) async {
               width: 110,
               child: pw.Text('LAB NUMBER',
                   style: pw.TextStyle(
-                      fontSize: 10, fontWeight: pw.FontWeight.bold)),
+                      fontSize: 10.5, fontWeight: pw.FontWeight.bold)),
             ),
-            pw.Text(': ', style: const pw.TextStyle(fontSize: 10)),
+            pw.Text(': ',
+                style: pw.TextStyle(
+                    fontSize: 10.5, fontWeight: pw.FontWeight.bold)),
             pw.Expanded(
                 child: pw.Text(r.reportNumber,
-                    style: const pw.TextStyle(fontSize: 10))),
+                    style: pw.TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: pw.FontWeight.bold))),
           ],
         ),
         pw.SizedBox(height: 4),
+        // Diagnosis-first ordering — same as the on-screen renderer.
+        // Clinical context, then the BOTTOM-LINE diagnosis (highlighted),
+        // then optional staging, then the supporting evidence.
         sect('CLINICAL INFORMATION', r.clinicalInformation),
+        diagnosisBlock(),
+        if (r.pathologicStaging.trim().isNotEmpty)
+          sect('PATHOLOGIC STAGING', r.pathologicStaging),
         sect('SPECIMEN', r.specimen),
         sect('GROSS EXAMINATION', r.grossExamination),
-        sect('MICROSCOPY AND IMPRESSION', r.microscopyImpression),
+        sect('MICROSCOPY', r.microscopyImpression),
         pw.SizedBox(height: 14),
         pw.Container(
           padding: const pw.EdgeInsets.all(8),
@@ -893,24 +1081,57 @@ Future<Uint8List> _buildPdfBytes(PathologyReport r) async {
           ),
         ),
         pw.SizedBox(height: 28),
-        pw.Align(
-          alignment: pw.Alignment.centerRight,
-          child: pw.Column(
-            crossAxisAlignment: pw.CrossAxisAlignment.end,
-            children: [
-              pw.Text(r.pathologistName,
-                  style: pw.TextStyle(
-                      fontSize: 11, fontWeight: pw.FontWeight.bold)),
-              pw.Text(r.pathologistRegistration,
-                  style: const pw.TextStyle(fontSize: 10)),
-              pw.Text(pathologistTitle,
-                  style: const pw.TextStyle(fontSize: 10)),
-            ],
-          ),
-        ),
+        _pdfSignatureBlock(r, pathologistTitle),
       ],
     ),
   );
 
   return doc.save();
+}
+
+/// PDF signature block: dual side-by-side when the report carries a second
+/// pathologist (snapshotted at save time when dual sign-out was on);
+/// otherwise the single right-aligned block we've always rendered.
+pw.Widget _pdfSignatureBlock(PathologyReport r, String primaryTitle) {
+  final hasSecond = r.pathologistName2.trim().isNotEmpty;
+  final secondTitle = SettingsService.getPathologist2Title();
+
+  pw.Widget signatory(String name, String reg, String title,
+      {required pw.CrossAxisAlignment align}) {
+    return pw.Column(
+      crossAxisAlignment: align,
+      children: [
+        pw.Text(name,
+            style:
+                pw.TextStyle(fontSize: 11, fontWeight: pw.FontWeight.bold)),
+        pw.Text(reg, style: const pw.TextStyle(fontSize: 10)),
+        pw.Text(title, style: const pw.TextStyle(fontSize: 10)),
+      ],
+    );
+  }
+
+  if (!hasSecond) {
+    return pw.Align(
+      alignment: pw.Alignment.centerRight,
+      child: signatory(
+          r.pathologistName, r.pathologistRegistration, primaryTitle,
+          align: pw.CrossAxisAlignment.end),
+    );
+  }
+  return pw.Row(
+    crossAxisAlignment: pw.CrossAxisAlignment.start,
+    children: [
+      pw.Expanded(
+        child: signatory(
+            r.pathologistName2, r.pathologistRegistration2, secondTitle,
+            align: pw.CrossAxisAlignment.start),
+      ),
+      pw.SizedBox(width: 24),
+      pw.Expanded(
+        child: signatory(
+            r.pathologistName, r.pathologistRegistration, primaryTitle,
+            align: pw.CrossAxisAlignment.end),
+      ),
+    ],
+  );
 }

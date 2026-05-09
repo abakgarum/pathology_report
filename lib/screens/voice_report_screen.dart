@@ -12,6 +12,7 @@ import '../services/settings_service.dart';
 import '../services/voice_command_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/voice_debug_panel.dart';
+import '../widgets/voice_unavailable_banner.dart';
 
 /// Fully voice-driven report creation.
 ///
@@ -402,6 +403,12 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
         reportedDate: DateTime.now(),
         pathologistName: SettingsService.getPathologistName(),
         pathologistRegistration: SettingsService.getPathologistRegistration(),
+        pathologistName2: SettingsService.getDualSignatureEnabled()
+            ? SettingsService.getPathologist2Name()
+            : '',
+        pathologistRegistration2: SettingsService.getDualSignatureEnabled()
+            ? SettingsService.getPathologist2Registration()
+            : '',
       );
 
       setState(() {
@@ -470,6 +477,10 @@ class _VoiceReportScreenState extends State<VoiceReportScreen>
       body: Column(
         children: [
           _topBar(),
+          // Persistent voice-unavailability banner — collapses when STT
+          // is healthy. Lets the doctor see the reason and recover with
+          // Retry / Open Settings without leaving the screen.
+          const VoiceUnavailableBanner(),
           Expanded(
             child: isWide
                 ? Row(

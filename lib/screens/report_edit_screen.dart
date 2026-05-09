@@ -3,6 +3,7 @@ import 'package:intl/intl.dart';
 
 import '../models/report_models.dart';
 import '../services/hive_storage_service.dart';
+import '../services/settings_service.dart';
 import '../theme/app_theme.dart';
 
 /// Edit every field of an existing [PathologyReport]: patient header,
@@ -53,10 +54,17 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
       'grossExamination': TextEditingController(text: r.grossExamination),
       'microscopyImpression':
           TextEditingController(text: r.microscopyImpression),
+      'diagnosisHeadline':
+          TextEditingController(text: r.diagnosisHeadline),
+      'pathologicStaging':
+          TextEditingController(text: r.pathologicStaging),
       'summary': TextEditingController(text: r.summary),
       'pathologistName': TextEditingController(text: r.pathologistName),
       'pathologistRegistration':
           TextEditingController(text: r.pathologistRegistration),
+      'pathologistName2': TextEditingController(text: r.pathologistName2),
+      'pathologistRegistration2':
+          TextEditingController(text: r.pathologistRegistration2),
     };
     _status = r.status;
     _sampleReceiptDate = r.sampleReceiptDate;
@@ -94,10 +102,15 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
       specimen: _c['specimen']!.text.trim(),
       grossExamination: _c['grossExamination']!.text.trim(),
       microscopyImpression: _c['microscopyImpression']!.text.trim(),
+      diagnosisHeadline: _c['diagnosisHeadline']!.text.trim(),
+      pathologicStaging: _c['pathologicStaging']!.text.trim(),
       summary: _c['summary']!.text.trim(),
       pathologistName: _c['pathologistName']!.text.trim(),
       pathologistRegistration:
           _c['pathologistRegistration']!.text.trim(),
+      pathologistName2: _c['pathologistName2']!.text.trim(),
+      pathologistRegistration2:
+          _c['pathologistRegistration2']!.text.trim(),
       status: _status,
       sampleReceiptDate: _sampleReceiptDate,
       reportedDate: _reportedDate,
@@ -324,11 +337,20 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
         children: [
           _field('clinicalInformation', 'Clinical information', maxLines: 3),
           const SizedBox(height: 12),
+          // Diagnosis-first fields rendered together so the doctor edits
+          // them as a logical pair — what the report opens with.
+          _field('diagnosisHeadline',
+              'Histopathology diagnosis (top-of-report headline)',
+              maxLines: 4),
+          const SizedBox(height: 12),
+          _field('pathologicStaging', 'Pathologic staging (pTNM / ypTNM)',
+              maxLines: 1),
+          const SizedBox(height: 12),
           _field('specimen', 'Specimen', maxLines: 3),
           const SizedBox(height: 12),
           _field('grossExamination', 'Gross examination', maxLines: 5),
           const SizedBox(height: 12),
-          _field('microscopyImpression', 'Microscopy and impression',
+          _field('microscopyImpression', 'Microscopy (synoptic block)',
               maxLines: 6),
           const SizedBox(height: 12),
           _field('summary', 'Clinical summary', maxLines: 3),
@@ -338,18 +360,48 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
   }
 
   Widget _footerCard() {
+    final dualSnapshotted =
+        widget.report.pathologistName2.trim().isNotEmpty;
+    final dualEnabled =
+        dualSnapshotted || SettingsService.getDualSignatureEnabled();
     return _card(
       icon: Icons.badge_rounded,
       title: 'Pathologist',
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Expanded(flex: 3, child: _field('pathologistName', 'Name')),
-          const SizedBox(width: 12),
-          Expanded(
-            flex: 2,
-            child:
-                _field('pathologistRegistration', 'Registration / KMC number'),
+          Row(
+            children: [
+              Expanded(flex: 3, child: _field('pathologistName', 'Name')),
+              const SizedBox(width: 12),
+              Expanded(
+                flex: 2,
+                child: _field(
+                    'pathologistRegistration', 'Registration / KMC number'),
+              ),
+            ],
           ),
+          if (dualEnabled) ...[
+            const SizedBox(height: 16),
+            const Text('Second signatory (dual sign-out)',
+                style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 0.5)),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                    flex: 3, child: _field('pathologistName2', 'Name')),
+                const SizedBox(width: 12),
+                Expanded(
+                  flex: 2,
+                  child: _field('pathologistRegistration2',
+                      'Registration / KMC number'),
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );

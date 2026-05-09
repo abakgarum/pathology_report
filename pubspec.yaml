@@ -1,7 +1,7 @@
 name: pathology_report
 description: A modern pathology report creation application for doctors.
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.0.0+2
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -34,6 +34,24 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.1
+  flutter_launcher_icons: ^0.13.1
+
+# Generates platform-native app icons from a single 1024x1024 PNG master.
+# Run with:  dart run flutter_launcher_icons
+# Source PNG is produced from tools/icon-source.svg via tools/setup_icon.sh.
+flutter_launcher_icons:
+  image_path: "tools/icon-master.png"
+  macos:
+    generate: true
+    image_path: "tools/icon-master.png"
+  windows:
+    generate: true
+    image_path: "tools/icon-master.png"
+    icon_size: 256
+  android: false
+  ios: false
+  web:
+    generate: false
 
 flutter:
   uses-material-design: true

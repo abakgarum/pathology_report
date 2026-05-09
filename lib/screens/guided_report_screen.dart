@@ -9,6 +9,7 @@ import '../services/openai_service.dart';
 import '../services/settings_service.dart';
 import '../services/voice_command_service.dart';
 import '../theme/app_theme.dart';
+import '../widgets/voice_unavailable_banner.dart';
 
 /// Voice-driven guided wizard backed by a parsed `TemplateSchema`.
 ///
@@ -85,6 +86,50 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
   // Live transcript pieces.
   String _liveFinal = '';
   String _livePartial = '';
+
+  // ─── Voice feedback (per question) ─────────────────────────────────────
+  // The doctor needs constant, unambiguous feedback about
+  //   (a) whether the mic is actively capturing audio right now, and
+  //   (b) what the recognizer just heard, and
+  //   (c) which answer that mapped to (if any).
+  //
+  // These three fields back the always-visible feedback panel rendered
+  // above the MCQ chips. They reset on every cursor move so each
+  // question starts with a clean slate.
+  String _lastFinal = '';
+  String _lastMatchLabel = '';
+  DateTime _lastMatchAt = DateTime.fromMillisecondsSinceEpoch(0);
+  // One-shot timer that triggers a rebuild ~4s after a match, to fade the
+  // green "→ Picked" chip when the doctor goes silent (no partials = no
+  // organic rebuilds).
+  Timer? _matchExpiryTimer;
+
+  // ─── MCQ voice safety state ────────────────────────────────────────────
+  // The on-device recognizer occasionally delivers a final transcript a
+  // beat or two AFTER we've moved to the next question (latency, network
+  // hiccups, or chunked finals on macOS/Windows). Without guarding, a
+  // late "colon" final from Q1 would fuzzy-match against Q2's "Colon"
+  // answer label and silently mis-select.
+  //
+  // Two guards:
+  //   1. Stamp `_questionStartedAt` whenever the cursor moves, and drop
+  //      any final transcript that arrives within `_staleGuardWindow`
+  //      after that stamp — those are bleed-overs from the previous Q.
+  //   2. Track the last accepted final text + timestamp; identical finals
+  //      within `_dupWindow` are duplicates the recognizer emitted twice.
+  DateTime _questionStartedAt = DateTime.now();
+  String _lastAcceptedFinal = '';
+  DateTime _lastAcceptedFinalAt =
+      DateTime.fromMillisecondsSinceEpoch(0);
+  static const Duration _staleGuardWindow = Duration(milliseconds: 500);
+  static const Duration _dupWindow = Duration(milliseconds: 1500);
+
+  /// Per-question prefix style. Alternating between A/B/C and 1/2/3 across
+  /// adjacent questions means a stale final ("two") from a previous numeric
+  /// question can't accidentally satisfy the prefix matcher when the
+  /// current question is alphabet-prefixed (and vice versa). The value
+  /// flips whenever `_cursor` moves.
+  bool _useAlphaPrefix(int idx) => idx.isEven;
 
   // Recording state for the current question (used for text/numeric answers
   // so we can transcribe with Whisper).
@@ -184,6 +229,7 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
     _cmdSub?.cancel();
     _transcriptSub?.cancel();
     _durationSub?.cancel();
+    _matchExpiryTimer?.cancel();
     _pulse.dispose();
     _audio.dispose();
     _patientIdCtrl.dispose();
@@ -219,6 +265,11 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
             ? u.text
             : '${_liveFinal.trim()} ${u.text.trim()}';
         _livePartial = '';
+        // Capture the most recent single utterance separately from the
+        // accumulating session transcript — the feedback panel shows
+        // "Heard: '<this>'" so the doctor sees, in plain words, exactly
+        // what the recognizer just committed.
+        _lastFinal = u.text.trim();
       } else {
         _livePartial = u.text;
       }
@@ -229,10 +280,30 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
       // tapping. Otherwise route to per-question answer matching.
       if (_pickedTemplate == null) {
         _maybeMatchTemplateFromTranscript(u.text);
-      } else {
+      } else if (_isAcceptableFinal(u.text)) {
         _maybeMatchAnswerFromTranscript(u.text);
       }
     }
+  }
+
+  /// Drop final transcripts that are stale (arrived right after we moved
+  /// to the next question) or duplicate (recognizer emitted the same
+  /// final twice in quick succession). Either condition would otherwise
+  /// produce a wrong selection on the *current* question.
+  bool _isAcceptableFinal(String text) {
+    final now = DateTime.now();
+    if (now.difference(_questionStartedAt) < _staleGuardWindow) {
+      return false; // bleed-over from the previous question
+    }
+    final t = text.trim().toLowerCase();
+    if (t.isEmpty) return false;
+    if (t == _lastAcceptedFinal &&
+        now.difference(_lastAcceptedFinalAt) < _dupWindow) {
+      return false; // duplicate emission
+    }
+    _lastAcceptedFinal = t;
+    _lastAcceptedFinalAt = now;
+    return true;
   }
 
   /// Match the spoken text against the available template names. Reuses the
@@ -271,8 +342,18 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
     if (q == null) return;
     if (q.type == TemplateQuestionType.singleSelect ||
         q.type == TemplateQuestionType.multiSelect) {
-      final matched = _fuzzyMatchAnswer(text, q.answers);
-      if (matched != null) _selectAnswer(q, matched);
+      // MCQ is prefix-only by design. The doctor says the option's
+      // letter ("A" / "alpha") or number ("one" / "1") — nothing else
+      // is accepted. Fuzzy label matching used to live here as a
+      // fallback, but it was the source of two real bugs:
+      //   1. A stale final from the previous question whose answer
+      //      label happened to overlap with a current option's label
+      //      would silently select the wrong option.
+      //   2. Free-form dictation in earlier sentences that contained
+      //      a current option's keyword would accidentally match.
+      // Prefix-only is fast, local (no API), and unambiguous.
+      final byPrefix = _matchAnswerByPrefix(text, q);
+      if (byPrefix != null) _selectAnswer(q, byPrefix);
     } else if (q.type == TemplateQuestionType.integer ||
         q.type == TemplateQuestionType.decimal) {
       final n = _extractNumber(text);
@@ -280,8 +361,10 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
         setState(() => _answers[q.id] = n);
       }
     } else if (q.type == TemplateQuestionType.text) {
-      // Accumulate the live transcript as the free-text answer; refined by
-      // Whisper when advancing if a recording was made.
+      // Accumulate the live transcript as the free-text answer.
+      // Whisper-refinement (when the doctor uses the Dictate button)
+      // runs asynchronously in the background — see
+      // `_stopRecordingForCurrent` — so the doctor never has to wait.
       _textAnswers[q.id] = (_textAnswers[q.id] ?? '').isEmpty
           ? text
           : '${_textAnswers[q.id]} $text';
@@ -289,34 +372,64 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
     }
   }
 
-  TemplateAnswer? _fuzzyMatchAnswer(
-      String spoken, List<TemplateAnswer> answers) {
-    if (answers.isEmpty) return null;
-    final tokens = _tokens(spoken);
-    if (tokens.isEmpty) return null;
-
-    TemplateAnswer? best;
-    double bestScore = 0;
-    for (final a in answers) {
-      final answerTokens = _tokens(a.label);
-      if (answerTokens.isEmpty) continue;
-      // Substring shortcut: speaker said the answer label as-is.
-      if (spoken.toLowerCase().contains(a.label.toLowerCase())) {
-        return a;
+  /// Match the spoken text against this question's prefix style.
+  ///
+  /// Each MCQ option is shown with a leading "1." / "2." / "3." OR
+  /// "A." / "B." / "C." (alternating per question). The doctor can say
+  /// the digit, the number word ("one", "first"), the letter ("A"), or
+  /// the NATO call-sign ("alpha"). We only accept matches in the style
+  /// the current question is showing — that's why a stale "two" final
+  /// from a numeric Q1 won't fire when an alphabet-prefixed Q2 is on
+  /// screen. Local, no API.
+  TemplateAnswer? _matchAnswerByPrefix(String spoken, TemplateQuestion q) {
+    if (q.answers.isEmpty) return null;
+    final lower = ' ${spoken.toLowerCase().trim()} ';
+    final useAlpha = _useAlphaPrefix(_cursor);
+    final dict = useAlpha ? _alphaWordToIndex : _numberWordToIndex;
+    int? hitIndex;
+    // Scan the dictionary for the LAST occurrence in the transcript so
+    // self-corrections like "two — actually three" pick the latest token.
+    int latestPos = -1;
+    dict.forEach((word, idx) {
+      final probe = ' $word ';
+      final pos = lower.lastIndexOf(probe);
+      if (pos > latestPos) {
+        latestPos = pos;
+        hitIndex = idx;
       }
-      // Token overlap score (Jaccard-style).
-      final inter = answerTokens.where(tokens.contains).length;
-      final union = ({...answerTokens, ...tokens}).length;
-      final score = union == 0 ? 0.0 : inter / union;
-      if (score > bestScore) {
-        bestScore = score;
-        best = a;
-      }
-    }
-    // Require a meaningful overlap to avoid false matches.
-    if (bestScore >= 0.6) return best;
-    return null;
+    });
+    if (hitIndex == null) return null;
+    if (hitIndex! < 0 || hitIndex! >= q.answers.length) return null;
+    return q.answers[hitIndex!];
   }
+
+  /// Number-word / digit → option index (0-based) for numeric prefix Qs.
+  static const Map<String, int> _numberWordToIndex = {
+    '1': 0, 'one': 0, 'first': 0,
+    '2': 1, 'two': 1, 'second': 1, 'too': 1, 'to': 1,
+    '3': 2, 'three': 2, 'third': 2,
+    '4': 3, 'four': 3, 'fourth': 3, 'for': 3,
+    '5': 4, 'five': 4, 'fifth': 4,
+    '6': 5, 'six': 5, 'sixth': 5,
+    '7': 6, 'seven': 6, 'seventh': 6,
+    '8': 7, 'eight': 7, 'eighth': 7,
+    '9': 8, 'nine': 8, 'ninth': 8,
+    '10': 9, 'ten': 9, 'tenth': 9,
+  };
+
+  /// Letter / NATO call-sign → option index (0-based) for alpha prefix Qs.
+  static const Map<String, int> _alphaWordToIndex = {
+    'a': 0, 'alpha': 0,
+    'b': 1, 'bravo': 1, 'be': 1, 'bee': 1,
+    'c': 2, 'charlie': 2, 'see': 2, 'sea': 2,
+    'd': 3, 'delta': 3, 'dee': 3,
+    'e': 4, 'echo': 4,
+    'f': 5, 'foxtrot': 5, 'ef': 5,
+    'g': 6, 'golf': 6, 'gee': 6,
+    'h': 7, 'hotel': 7, 'aitch': 7,
+    'i': 8, 'india': 8, 'eye': 8,
+    'j': 9, 'juliet': 9, 'jay': 9,
+  };
 
   Set<String> _tokens(String s) {
     return s
@@ -346,6 +459,44 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
 
   Future<void> _handleCommand(VoiceCommandEvent e) async {
     if (!mounted) return;
+
+    // While the doctor is actively dictating a free-text or numeric
+    // answer, every word they say is CONTENT, not a command. Without
+    // this guard, dictating a phrase like "the patient was saved" or
+    // "stop the bleeding was noted" would fire `save` / `stop` and
+    // truncate the recording mid-sentence. Only `stop` (finish
+    // dictation) and `cancel`/`discard` (abandon this clip) survive.
+    if (_recording) {
+      if (e.command == VoiceCommand.stop) {
+        await _stopRecordingForCurrent();
+      } else if (e.command == VoiceCommand.cancel ||
+          e.command == VoiceCommand.discard) {
+        // Stop the recorder, drop the captured audio, leave the answer
+        // empty so the doctor can re-record.
+        await _audio.stopRecording();
+        setState(() {
+          _recording = false;
+          _liveFinal = '';
+          _livePartial = '';
+          _statusMessage = 'Recording discarded — tap Dictate to retry.';
+        });
+      }
+      return;
+    }
+
+    // Stale-guard for navigation commands. If the doctor just advanced
+    // to a new question, drop any `next`/`previous`/`skip` that arrives
+    // within the same window we use to drop stale answer transcripts —
+    // it's almost always a delayed duplicate of the command that moved
+    // us here, not a deliberate second advance.
+    if (e.command == VoiceCommand.next ||
+        e.command == VoiceCommand.previous ||
+        e.command == VoiceCommand.skip) {
+      if (DateTime.now().difference(_questionStartedAt) <
+          _staleGuardWindow) {
+        return;
+      }
+    }
 
     if (e.command == VoiceCommand.back ||
         e.command == VoiceCommand.dashboard) {
@@ -418,6 +569,8 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
     setState(() {
       _confirmedPatientId = id;
       _patientIdConfirmed = true;
+      _questionStartedAt = DateTime.now();
+      _lastAcceptedFinal = '';
       _statusMessage = _queue.isEmpty
           ? 'Template has no questions to answer.'
           : 'Question 1 of ${_queue.length} — answer with voice or tap.';
@@ -433,7 +586,20 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
       } else {
         _answers[q.id] = a.label;
       }
+      // Surface the match in the feedback panel so the doctor sees the
+      // explicit "→ picked B. Colon" confirmation. Without this, voice
+      // selection is invisible — the chip just lights up and the
+      // doctor has to scan to verify.
+      _lastMatchLabel = a.label;
+      _lastMatchAt = DateTime.now();
       _maybeReshapeQueue(q, a);
+    });
+    // Schedule a rebuild so the green chip fades on its own even if no
+    // partials arrive in the meantime. Re-arms on every match so rapid
+    // multi-select picks each get their own 4s window.
+    _matchExpiryTimer?.cancel();
+    _matchExpiryTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted) setState(() {});
     });
   }
 
@@ -509,6 +675,10 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
         _cursor += 1;
         _liveFinal = '';
         _livePartial = '';
+        _lastFinal = '';
+        _lastMatchLabel = '';
+        _questionStartedAt = DateTime.now();
+        _lastAcceptedFinal = '';
         _statusMessage =
             'Question ${_cursor + 1} of ${_queue.length} — answer with voice or tap.';
       });
@@ -523,6 +693,10 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
       _cursor -= 1;
       _liveFinal = '';
       _livePartial = '';
+      _lastFinal = '';
+      _lastMatchLabel = '';
+      _questionStartedAt = DateTime.now();
+      _lastAcceptedFinal = '';
       _statusMessage =
           'Question ${_cursor + 1} of ${_queue.length}.';
     });
@@ -586,73 +760,140 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
 
     // Persist the raw clip immediately — the detail screen's playback panel
     // pulls from this list, and we want the file kept even if Whisper errors
-    // or the user backs out.
+    // or the user backs out. Seed the clip's transcription with the on-device
+    // STT result so the report has a usable transcript even before any
+    // background Whisper refinement returns.
     final rec = VoiceRecording(
       filePath: path,
       duration: clipDuration,
       label: q.label,
       transcription: liveSeed,
     );
-    setState(() {
-      _recordings.add(rec);
-      _transcribingQuestionId = q.id;
-      _statusMessage = 'Transcribing "${q.label}"…';
-    });
+    setState(() => _recordings.add(rec));
 
-    // Whisper-correct the captured audio so the answer is high-accuracy.
-    try {
-      final text = await OpenAIService.transcribeAudio(
-        path,
-        prompt: 'Histopathology answer to: ${q.label}',
-      );
-      if (!mounted) return;
-      final corrected = text.trim();
-      if (corrected.isEmpty) {
-        _setStatus(liveSeed.isEmpty
-            ? 'Whisper returned no text — try dictating again.'
-            : 'Whisper returned no text — kept live transcript.');
-      } else {
-        // Upgrade the stored clip transcription to the Whisper version.
-        final idx = _recordings.indexWhere((r) => r.id == rec.id);
-        if (idx != -1) {
-          _recordings[idx] = _recordings[idx].copyWith(transcription: corrected);
-        }
-        if (q.type == TemplateQuestionType.text) {
+    // ─── Apply the live transcript IMMEDIATELY ─────────────────────────
+    // The doctor should never wait on a network round-trip to move on.
+    // We commit the on-device STT result as the answer right now; if a
+    // background Whisper refinement arrives later, it silently upgrades
+    // the stored clip transcription (and, for free-text answers only,
+    // the displayed answer — but only if the doctor hasn't edited it).
+    bool needsWhisper = false;
+    switch (q.type) {
+      case TemplateQuestionType.singleSelect:
+      case TemplateQuestionType.multiSelect:
+        // MCQ is alphabet-/numeric-only by design — no Whisper, no API
+        // call. The doctor said "A" or "two"; the local prefix matcher
+        // already chose the option from the live partials. If the live
+        // seed (final) re-confirms a match, apply it; otherwise leave
+        // whatever was selected during partials in place.
+        final matched = _matchAnswerByPrefix(liveSeed, q);
+        if (matched != null) _selectAnswer(q, matched);
+        _setStatus(_answers[q.id] == null
+            ? 'Say "A", "B"… or "one", "two"… to pick an option.'
+            : 'Answer captured.');
+        break;
+
+      case TemplateQuestionType.integer:
+      case TemplateQuestionType.decimal:
+        // Digits and number-words transcribe reliably on-device. Try
+        // parsing the live seed first — if we get a number, we're done
+        // (no Whisper). Only fall back to Whisper when the doctor
+        // dictated something the local parser couldn't read.
+        final n = _extractNumber(liveSeed);
+        if (n != null) {
           setState(() {
-            _textAnswers[q.id] = corrected;
-            _answers[q.id] = corrected;
+            _answers[q.id] = n;
             _statusMessage = 'Answer captured.';
           });
+        } else {
+          needsWhisper = true;
+          setState(() => _statusMessage =
+              'Refining number from audio · you can move on.');
+        }
+        break;
+
+      case TemplateQuestionType.text:
+        // Free-form comments — apply the live seed as the answer right
+        // now so the doctor can advance, then call Whisper in the
+        // background to upgrade transcription quality. This is the
+        // ONLY place we still use Whisper.
+        if (liveSeed.isNotEmpty) {
+          setState(() {
+            _textAnswers[q.id] = liveSeed;
+            _answers[q.id] = liveSeed;
+            _statusMessage =
+                'Answer captured · refining transcript in background.';
+          });
+        }
+        needsWhisper = true;
+        break;
+
+      case TemplateQuestionType.date:
+        // Dates are picked via the date-picker, never Whisper-routed.
+        break;
+    }
+
+    if (needsWhisper) {
+      _refineWithWhisperInBackground(rec, q, path, liveSeed);
+    }
+  }
+
+  /// Run Whisper transcription as a background task. Never blocks the UI.
+  ///
+  /// When it returns:
+  ///   - The stored clip's transcription is upgraded to the Whisper text
+  ///     (so the Detail screen and the composed report use the higher-
+  ///     accuracy version).
+  ///   - For free-text questions, if the doctor hasn't manually edited
+  ///     the answer since we applied the live seed, the answer field is
+  ///     also upgraded to the Whisper text.
+  ///   - For numeric questions, if the answer is still empty (i.e. the
+  ///     live seed couldn't be parsed), we try to extract a number from
+  ///     the Whisper text and apply it.
+  ///
+  /// If the doctor advanced past this question, has answered something
+  /// else, or has saved the report by the time Whisper returns, the
+  /// upgrade is silent — never clobbering doctor input.
+  void _refineWithWhisperInBackground(
+      VoiceRecording rec, TemplateQuestion q, String path, String liveSeed) {
+    setState(() => _transcribingQuestionId = q.id);
+    OpenAIService.transcribeAudio(
+      path,
+      prompt: 'Histopathology answer to: ${q.label}',
+    ).then((text) {
+      if (!mounted) return;
+      final corrected = text.trim();
+      if (corrected.isNotEmpty) {
+        // Upgrade clip transcription regardless of UI state.
+        final idx = _recordings.indexWhere((r) => r.id == rec.id);
+        if (idx != -1) {
+          _recordings[idx] =
+              _recordings[idx].copyWith(transcription: corrected);
+        }
+        // Conditional answer upgrade — only if the doctor hasn't moved
+        // the goalposts since we seeded.
+        if (q.type == TemplateQuestionType.text) {
+          final current = (_answers[q.id] ?? '').toString();
+          if (current == liveSeed || current.isEmpty) {
+            setState(() {
+              _textAnswers[q.id] = corrected;
+              _answers[q.id] = corrected;
+            });
+          }
         } else if (q.type == TemplateQuestionType.integer ||
             q.type == TemplateQuestionType.decimal) {
-          final n = _extractNumber(corrected);
-          if (n != null) {
-            setState(() {
-              _answers[q.id] = n;
-              _statusMessage = 'Answer captured.';
-            });
-          } else {
-            _setStatus('Could not read a number from "$corrected".');
-          }
-        } else if (q.type == TemplateQuestionType.singleSelect ||
-            q.type == TemplateQuestionType.multiSelect) {
-          final matched = _fuzzyMatchAnswer(corrected, q.answers);
-          if (matched != null) {
-            _selectAnswer(q, matched);
-            _setStatus('Answer captured.');
-          } else {
-            _setStatus('No matching choice for "$corrected" — pick one or retry.');
+          if (_answers[q.id] == null) {
+            final n = _extractNumber(corrected);
+            if (n != null) setState(() => _answers[q.id] = n);
           }
         }
       }
-    } catch (e) {
-      if (!mounted) return;
-      _setStatus(liveSeed.isEmpty
-          ? 'Whisper failed — re-record or type the answer · $e'
-          : 'Whisper failed — kept live transcript · $e');
-    } finally {
       if (mounted) setState(() => _transcribingQuestionId = null);
-    }
+    }).catchError((Object _) {
+      // Background refinement is best-effort. If it fails we keep the
+      // live seed; nothing to surface to the doctor.
+      if (mounted) setState(() => _transcribingQuestionId = null);
+    });
   }
 
   // ─── Compose & save ───────────────────────────────────────────────────
@@ -712,6 +953,10 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
         // Synoptic block lives in microscopy_impression so it surfaces in the
         // existing report layout. composeSynopticReport returns it as 'synoptic'.
         microscopyImpression: composed['synoptic'] ?? '',
+        // Diagnosis-first headline + pTNM staging — rendered prominently at
+        // the top of the report (after Clinical Information).
+        diagnosisHeadline: composed['diagnosis_headline'] ?? '',
+        pathologicStaging: composed['pathologic_staging'] ?? '',
         summary: composed['summary'] ?? '',
         rawTranscript: rawTranscript,
         voiceRecordings: List.of(_recordings),
@@ -722,6 +967,12 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
         pathologistName: SettingsService.getPathologistName(),
         pathologistRegistration:
             SettingsService.getPathologistRegistration(),
+        pathologistName2: SettingsService.getDualSignatureEnabled()
+            ? SettingsService.getPathologist2Name()
+            : '',
+        pathologistRegistration2: SettingsService.getDualSignatureEnabled()
+            ? SettingsService.getPathologist2Registration()
+            : '',
       );
       await HiveStorageService.saveReport(report);
       widget.onReportSaved?.call(report);
@@ -757,6 +1008,12 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
       body: Column(
         children: [
           _topBar(),
+          // Persistent voice-unavailability banner. Collapses to nothing
+          // when STT is healthy, so it costs zero pixels in the happy
+          // path. When voice is down, the doctor sees the reason and a
+          // Retry button up here — far more discoverable than the small
+          // listening pill in the top-right.
+          const VoiceUnavailableBanner(),
           Expanded(
             child: isWide
                 ? Row(
@@ -840,42 +1097,67 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
     return StreamBuilder<String>(
       stream: _voice.status,
       builder: (context, snap) {
+        // Three-way state — was two before, but "Idle" was misleading
+        // when the recognizer had actually failed to initialise.
+        final available = _voice.isAvailable;
+        final initialized = _voice.isInitialized;
         final listening = _voice.isListening;
-        return Container(
-          padding:
-              const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          decoration: BoxDecoration(
-            color: (listening ? AppColors.success : AppColors.textHint)
-                .withOpacity(0.12),
-            borderRadius: BorderRadius.circular(16),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              AnimatedBuilder(
-                animation: _pulse,
-                builder: (_, child) => Transform.scale(
-                  scale: listening ? 1 + 0.15 * _pulse.value : 1,
-                  child: child,
-                ),
-                child: Container(
-                  width: 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: listening ? AppColors.success : AppColors.textHint,
+
+        late final Color color;
+        late final String label;
+        late final IconData icon;
+        bool animate = false;
+        if (!initialized) {
+          color = AppColors.textHint;
+          label = 'Starting…';
+          icon = Icons.hourglass_empty_rounded;
+        } else if (!available) {
+          color = AppColors.warning;
+          label = 'Voice off';
+          icon = Icons.mic_off_rounded;
+        } else if (listening) {
+          color = AppColors.success;
+          label = 'Listening';
+          icon = Icons.graphic_eq_rounded;
+          animate = true;
+        } else {
+          color = AppColors.textHint;
+          label = 'Idle';
+          icon = Icons.mic_none_rounded;
+        }
+
+        return Tooltip(
+          message: !available
+              ? (_voice.lastError.isEmpty
+                  ? 'Speech recognition unavailable on this system'
+                  : _voice.lastError)
+              : (listening ? 'Listening for voice commands' : 'Mic idle'),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: color.withValues(alpha: 0.3)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                AnimatedBuilder(
+                  animation: _pulse,
+                  builder: (_, child) => Transform.scale(
+                    scale: animate ? 1 + 0.15 * _pulse.value : 1,
+                    child: child,
                   ),
+                  child: Icon(icon, size: 11, color: color),
                 ),
-              ),
-              const SizedBox(width: 6),
-              Text(listening ? 'Listening' : 'Idle',
-                  style: TextStyle(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w700,
-                      color: listening
-                          ? AppColors.success
-                          : AppColors.textHint)),
-            ],
+                const SizedBox(width: 6),
+                Text(label,
+                    style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: color)),
+              ],
+            ),
           ),
         );
       },
@@ -1177,9 +1459,13 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
               ],
             ),
             const SizedBox(height: 16),
-            _answerInput(q, answer),
-            const SizedBox(height: 16),
+            // Voice feedback ABOVE the chips — the doctor's eye lands on
+            // "Listening — speak now" / "Heard: …" / "→ Picked …" before
+            // scanning options, so they always know whether their voice
+            // landed.
             _liveTranscriptBanner(),
+            const SizedBox(height: 16),
+            _answerInput(q, answer),
             const SizedBox(height: 16),
             _navRow(q),
             const SizedBox(height: 8),
@@ -1228,56 +1514,74 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
   Widget _answerInput(TemplateQuestion q, dynamic current) {
     switch (q.type) {
       case TemplateQuestionType.singleSelect:
-        return Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: q.answers.map((a) {
-            final selected = current == a.label;
-            return ChoiceChip(
-              label: Text(a.label),
-              selected: selected,
-              onSelected: (_) => _selectAnswer(q, a),
-              labelStyle: TextStyle(
-                color: selected ? AppColors.primary : AppColors.textPrimary,
-                fontWeight:
-                    selected ? FontWeight.w700 : FontWeight.w500,
-                fontSize: 12,
-              ),
-              selectedColor: AppColors.primary.withOpacity(0.18),
-            );
-          }).toList(),
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _prefixHint(q),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: List.generate(q.answers.length, (i) {
+                final a = q.answers[i];
+                final selected = current == a.label;
+                return ChoiceChip(
+                  label: Text('${_prefixLabel(i)}  ${a.label}'),
+                  selected: selected,
+                  onSelected: (_) => _selectAnswer(q, a),
+                  labelStyle: TextStyle(
+                    color:
+                        selected ? AppColors.primary : AppColors.textPrimary,
+                    fontWeight:
+                        selected ? FontWeight.w700 : FontWeight.w500,
+                    fontSize: 12,
+                  ),
+                  selectedColor: AppColors.primary.withOpacity(0.18),
+                );
+              }),
+            ),
+          ],
         );
       case TemplateQuestionType.multiSelect:
         final picked = (current as List?)?.cast<String>() ?? <String>[];
-        return Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: q.answers.map((a) {
-            final selected = picked.contains(a.label);
-            return FilterChip(
-              label: Text(a.label),
-              selected: selected,
-              onSelected: (s) {
-                setState(() {
-                  final list = List<String>.from(picked);
-                  if (s) {
-                    if (!list.contains(a.label)) list.add(a.label);
-                  } else {
-                    list.remove(a.label);
-                  }
-                  _answers[q.id] = list;
-                });
-              },
-              labelStyle: TextStyle(
-                color:
-                    selected ? AppColors.primary : AppColors.textPrimary,
-                fontWeight:
-                    selected ? FontWeight.w700 : FontWeight.w500,
-                fontSize: 12,
-              ),
-              selectedColor: AppColors.primary.withOpacity(0.18),
-            );
-          }).toList(),
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _prefixHint(q),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: List.generate(q.answers.length, (i) {
+                final a = q.answers[i];
+                final selected = picked.contains(a.label);
+                return FilterChip(
+                  label: Text('${_prefixLabel(i)}  ${a.label}'),
+                  selected: selected,
+                  onSelected: (s) {
+                    setState(() {
+                      final list = List<String>.from(picked);
+                      if (s) {
+                        if (!list.contains(a.label)) list.add(a.label);
+                      } else {
+                        list.remove(a.label);
+                      }
+                      _answers[q.id] = list;
+                    });
+                  },
+                  labelStyle: TextStyle(
+                    color: selected
+                        ? AppColors.primary
+                        : AppColors.textPrimary,
+                    fontWeight:
+                        selected ? FontWeight.w700 : FontWeight.w500,
+                    fontSize: 12,
+                  ),
+                  selectedColor: AppColors.primary.withOpacity(0.18),
+                );
+              }),
+            ),
+          ],
         );
       case TemplateQuestionType.text:
         final ctrl = TextEditingController(text: (current ?? '').toString());
@@ -1359,44 +1663,93 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
     }
   }
 
+  /// Prefix shown on each MCQ chip ("1." / "A.") for the current question.
+  String _prefixLabel(int answerIndex) {
+    if (_useAlphaPrefix(_cursor)) {
+      // 0 → A, 1 → B, ... wraps after 26 (extremely rare in pathology
+      // synoptics but kept harmless).
+      final code = ('A'.codeUnitAt(0) + (answerIndex % 26));
+      return '${String.fromCharCode(code)}.';
+    }
+    return '${answerIndex + 1}.';
+  }
+
+  /// Inline hint above the MCQ chips telling the doctor what they can say
+  /// to pick by voice — alternates "say A / B / C..." vs "say one / two…"
+  /// so they immediately know whether the current question is letter-keyed
+  /// or number-keyed.
+  Widget _prefixHint(TemplateQuestion q) {
+    final useAlpha = _useAlphaPrefix(_cursor);
+    final hint = useAlpha
+        ? 'Say "A", "B", "C"… to pick.'
+        : 'Say "one", "two", "three"… to pick.';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceVariant,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            useAlpha
+                ? Icons.abc_rounded
+                : Icons.format_list_numbered_rounded,
+            size: 14,
+            color: AppColors.primary,
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(hint,
+                style: const TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.textSecondary)),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _recordButtonRow() {
-    final transcribing = _transcribingQuestionId != null &&
+    // `refining` is purely a status indicator now — the button stays
+    // enabled so the doctor can re-record or move on while the Whisper
+    // call is in flight. The recorded clip's transcription will be
+    // upgraded silently when the call returns.
+    final refining = _transcribingQuestionId != null &&
         _transcribingQuestionId == _currentQuestion?.id;
     return Row(
       children: [
         FilledButton.icon(
-          onPressed: transcribing
-              ? null
-              : (_recording
-                  ? _stopRecordingForCurrent
-                  : _startRecordingForCurrent),
+          onPressed: _recording
+              ? _stopRecordingForCurrent
+              : _startRecordingForCurrent,
           style: FilledButton.styleFrom(
-            backgroundColor: transcribing
-                ? AppColors.textHint
-                : (_recording ? AppColors.error : AppColors.primary),
+            backgroundColor: _recording ? AppColors.error : AppColors.primary,
           ),
-          icon: transcribing
-              ? const SizedBox(
-                  width: 14,
-                  height: 14,
-                  child: CircularProgressIndicator(
-                      strokeWidth: 2, color: Colors.white))
-              : Icon(_recording ? Icons.stop_rounded : Icons.mic_rounded,
-                  size: 16),
-          label: Text(transcribing
-              ? 'Transcribing…'
-              : (_recording
-                  ? 'Stop (${_fmtDur(_recordingDuration)})'
-                  : 'Dictate')),
+          icon: Icon(
+              _recording ? Icons.stop_rounded : Icons.mic_rounded,
+              size: 16),
+          label: Text(_recording
+              ? 'Stop (${_fmtDur(_recordingDuration)})'
+              : 'Dictate'),
         ),
         const SizedBox(width: 8),
+        if (refining) ...[
+          const SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(
+                  strokeWidth: 2, color: AppColors.primary)),
+          const SizedBox(width: 6),
+        ],
         Expanded(
           child: Text(
-            transcribing
-                ? 'Sending audio to Whisper — this usually takes a few seconds.'
-                : (_recording
-                    ? 'Recording — speak the answer.'
-                    : 'Tap to capture a high-accuracy Whisper answer.'),
+            _recording
+                ? 'Recording — speak the answer, then say "stop" or "next".'
+                : (refining
+                    ? 'Refining transcript in background — feel free to move on.'
+                    : 'Tap to dictate a free-text comment.'),
             style: Theme.of(context).textTheme.bodySmall,
           ),
         ),
@@ -1410,45 +1763,196 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
     return '$m:$s';
   }
 
+  /// Always-visible voice feedback panel. Renders four rows of state so the
+  /// doctor never has to wonder whether the mic is hot, what was just heard,
+  /// or which option that mapped to:
+  ///
+  ///   1. **Mic state** — pulsing green dot + "Listening — speak now" while
+  ///      the recognizer is hot, dimmed grey "Mic idle" otherwise.
+  ///   2. **Live (in-progress) words** — partials stream in italic, char by
+  ///      char, so the doctor watches the recognizer hear them.
+  ///   3. **Last heard** — the last *finalised* utterance, in a pill, so even
+  ///      if it didn't match anything the doctor can see why and try again.
+  ///   4. **Match confirmation** — a green chip "→ picked B. Colon" that
+  ///      fades in for ~2.5s after each successful selection.
   Widget _liveTranscriptBanner() {
-    final f = _liveFinal.trim();
-    final p = _livePartial.trim();
-    if (f.isEmpty && p.isEmpty) return const SizedBox.shrink();
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: AppColors.surfaceVariant,
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Icon(Icons.graphic_eq_rounded,
-              size: 14, color: AppColors.primary),
-          const SizedBox(width: 8),
-          Expanded(
-            child: RichText(
-              text: TextSpan(
-                style: const TextStyle(
-                    fontSize: 12,
-                    height: 1.4,
-                    color: AppColors.textPrimary),
-                children: [
-                  if (f.isNotEmpty) TextSpan(text: f),
-                  if (f.isNotEmpty && p.isNotEmpty) const TextSpan(text: ' '),
-                  if (p.isNotEmpty)
-                    TextSpan(
-                      text: p,
-                      style: const TextStyle(
-                          color: AppColors.textHint,
-                          fontStyle: FontStyle.italic),
-                    ),
-                ],
-              ),
+    return StreamBuilder<String>(
+      stream: _voice.status,
+      builder: (context, _) {
+        final listening = _voice.isListening;
+        final partial = _livePartial.trim();
+        final lastFinal = _lastFinal.trim();
+        final lastMatch = _lastMatchLabel.trim();
+        // Only show the green "match" chip while it's recent — otherwise it
+        // misleads the doctor on the next question into thinking the previous
+        // match still applies.
+        final matchVisible = lastMatch.isNotEmpty &&
+            DateTime.now().difference(_lastMatchAt) <
+                const Duration(seconds: 4);
+
+        return Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: AppColors.surfaceVariant,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: listening
+                  ? AppColors.success.withValues(alpha: 0.45)
+                  : AppColors.border,
             ),
           ),
-        ],
-      ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Row 1: mic state with pulsing dot.
+              Row(
+                children: [
+                  AnimatedBuilder(
+                    animation: _pulse,
+                    builder: (_, child) => Transform.scale(
+                      scale: listening ? 1 + 0.25 * _pulse.value : 1,
+                      child: child,
+                    ),
+                    child: Container(
+                      width: 10,
+                      height: 10,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: listening
+                            ? AppColors.success
+                            : AppColors.textHint,
+                        boxShadow: listening
+                            ? [
+                                BoxShadow(
+                                  color: AppColors.success
+                                      .withValues(alpha: 0.4),
+                                  blurRadius: 6,
+                                  spreadRadius: 1,
+                                )
+                              ]
+                            : null,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Icon(
+                      listening
+                          ? Icons.mic_rounded
+                          : Icons.mic_off_rounded,
+                      size: 14,
+                      color: listening
+                          ? AppColors.success
+                          : AppColors.textHint),
+                  const SizedBox(width: 6),
+                  Text(
+                    listening
+                        ? (partial.isNotEmpty
+                            ? 'Listening — hearing you now'
+                            : 'Listening — speak now')
+                        : 'Mic idle — tap any chip or say "next"',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: listening
+                          ? AppColors.success
+                          : AppColors.textHint,
+                    ),
+                  ),
+                ],
+              ),
+              // Row 2: live partial — italic, dimmed, growing in real-time.
+              if (partial.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.graphic_eq_rounded,
+                        size: 13, color: AppColors.primary),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        '$partial…',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontStyle: FontStyle.italic,
+                          color: AppColors.textSecondary,
+                          height: 1.3,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+              // Row 3: last finalised utterance — what the recognizer
+              // committed. Stays visible even after the partial cleared,
+              // so the doctor always has a record of "what you said".
+              if (lastFinal.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.hearing_rounded,
+                        size: 13, color: AppColors.textSecondary),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: RichText(
+                        text: TextSpan(
+                          style: const TextStyle(
+                            fontSize: 12,
+                            height: 1.3,
+                            color: AppColors.textPrimary,
+                          ),
+                          children: [
+                            const TextSpan(
+                                text: 'Heard: ',
+                                style: TextStyle(
+                                    fontWeight: FontWeight.w700,
+                                    color: AppColors.textSecondary)),
+                            TextSpan(text: '"$lastFinal"'),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+              // Row 4: explicit match confirmation. Fades after 4s.
+              if (matchVisible) ...[
+                const SizedBox(height: 8),
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 250),
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: AppColors.success.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                        color: AppColors.success.withValues(alpha: 0.4)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.check_circle_rounded,
+                          size: 14, color: AppColors.success),
+                      const SizedBox(width: 6),
+                      Flexible(
+                        child: Text(
+                          '→ Picked: $lastMatch',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: AppColors.success,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -1493,8 +1997,8 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
                     height: 14,
                     child: CircularProgressIndicator(
                         strokeWidth: 2, color: Colors.white))
-                : const Icon(Icons.save_rounded, size: 16),
-            label: Text(_composing ? 'Composing…' : 'Save report'),
+                : const Icon(Icons.task_alt_rounded, size: 16),
+            label: Text(_composing ? 'Composing…' : 'Sign out report'),
             style: FilledButton.styleFrom(
               backgroundColor: AppColors.success,
             ),
@@ -1546,7 +2050,7 @@ class _GuidedReportScreenState extends State<GuidedReportScreen>
                           child: CircularProgressIndicator(
                               strokeWidth: 2, color: Colors.white))
                       : const Icon(Icons.auto_awesome, size: 16),
-                  label: Text(_composing ? 'Composing…' : 'Compose & save'),
+                  label: Text(_composing ? 'Composing…' : 'Compose & sign out'),
                 ),
               ),
             ],

@@ -65,6 +65,17 @@ class VoiceCommandService {
   String _lastError = '';
   String _lastStatus = '';
 
+  // Partial-stability dispatch. The recognizer's `finalResult` flag only
+  // flips after the OS sees `pauseFor` of silence, which can lag a full
+  // second or two behind the doctor finishing a short command like
+  // "new report". To stay snappy we also dispatch off a partial once its
+  // text has been *unchanged* for a short window — a stable partial is a
+  // strong signal that the doctor stopped talking. The eventual final
+  // re-emits the same command, but `_fire`'s dedup window swallows it.
+  String _lastPartialText = '';
+  Timer? _partialStabilityTimer;
+  static const Duration _partialStability = Duration(milliseconds: 700);
+
   final _commandController = StreamController<VoiceCommandEvent>.broadcast();
   final _transcriptController =
       StreamController<TranscriptUpdate>.broadcast();
@@ -123,6 +134,11 @@ class VoiceCommandService {
         debugLogging: kDebugMode,
       );
       _initialized = true;
+      // Fan out an availability event so any UI watching `_voice.status`
+      // (banners, listening pills) re-renders the moment we know the
+      // recognizer's state — without this, screens that called start()
+      // before init completed never learn that voice is unavailable.
+      _statusController.add(_available ? 'available' : 'unavailable');
       bool hasPerm = false;
       try {
         hasPerm = await _stt.hasPermission;
@@ -176,12 +192,19 @@ class VoiceCommandService {
     _currentlyListening = false;
     _shouldListen = false;
     _listenInFlight = false;
+    _partialStabilityTimer?.cancel();
+    _partialStabilityTimer = null;
+    _lastPartialText = '';
     _lastError = '';
     final ok = await init();
     if (ok) {
       _shouldListen = true;
       await _listenOnce();
     }
+    // init() already fans out an availability event; we mirror it here
+    // so callers that explicitly retry see a status push even when init
+    // had nothing to change.
+    _statusController.add(ok ? 'available' : 'unavailable');
     return ok;
   }
 
@@ -233,6 +256,9 @@ class VoiceCommandService {
   Future<void> stop() async {
     _log('info', 'stop() called');
     _shouldListen = false;
+    _partialStabilityTimer?.cancel();
+    _partialStabilityTimer = null;
+    _lastPartialText = '';
     try {
       await _stt.stop();
     } catch (e) {
@@ -296,6 +322,8 @@ class VoiceCommandService {
 
   void dispose() {
     _shouldListen = false;
+    _partialStabilityTimer?.cancel();
+    _partialStabilityTimer = null;
     _stt.stop();
     _commandController.close();
     _transcriptController.close();
@@ -336,7 +364,13 @@ class VoiceCommandService {
         // cap when on-device recognition is enabled, so a 5-minute window is
         // safe and avoids forced restarts within a typical dictation.
         listenFor: const Duration(minutes: 5),
-        pauseFor: const Duration(seconds: 10),
+        // pauseFor is the silence the OS waits before flipping a result to
+        // `finalResult: true`. The earlier 10s setting meant a doctor saying
+        // "new report" had to sit through up to 10s of dead air before the
+        // command actually fired. 2s is the safety net — most short commands
+        // dispatch faster than this via the stable-partial path in
+        // `_onResult`.
+        pauseFor: const Duration(seconds: 2),
         localeId: SettingsService.getLocale(),
         listenOptions: stt.SpeechListenOptions(
           partialResults: true,
@@ -377,60 +411,137 @@ class VoiceCommandService {
         'onResult ${r.finalResult ? "final" : "partial"}: "$text"');
     _transcriptController
         .add(TranscriptUpdate(text, isFinal: r.finalResult));
+
     if (r.finalResult) {
+      // The final lands; cancel any pending partial dispatch — if a stable
+      // partial already fired the same command, `_fire`'s dedup window
+      // suppresses this one. Either way we're done with the partial state.
+      _partialStabilityTimer?.cancel();
+      _partialStabilityTimer = null;
+      _lastPartialText = '';
       if (_sessionTranscript.isEmpty) {
         _sessionTranscript = text;
       } else {
         _sessionTranscript = '$_sessionTranscript $text';
       }
-    }
-    _detectCommands(text);
-  }
-
-  void _detectCommands(String text) {
-    final lower = text.toLowerCase();
-    final phrases = SettingsService.getPhrases();
-
-    // Patient ID trigger
-    final patientIdPhrase = phrases[VoiceCommand.patientId.key] ?? '';
-    for (final alt in _split(patientIdPhrase)) {
-      final idx = lower.lastIndexOf(alt);
-      if (idx == -1) continue;
-      final rest = lower.substring(idx + alt.length).trim();
-      if (rest.isEmpty) continue;
-      final tail = _trimAtAnyCommand(rest, phrases);
-      final normalized = _normalizePatientId(tail);
-      if (normalized.isEmpty) continue;
-      _fire(VoiceCommand.patientId, payload: normalized, raw: '$alt $tail');
+      _detectCommands(text);
       return;
     }
 
-    // Other commands
+    // Partial. Re-arm the stability timer only when the recognizer's text
+    // has actually changed — partials sometimes re-emit the same string
+    // multiple times, and we don't want each repeat to push the dispatch
+    // out by another window.
+    if (text == _lastPartialText) return;
+    _lastPartialText = text;
+    _partialStabilityTimer?.cancel();
+    _partialStabilityTimer = Timer(_partialStability, () {
+      // The user could have stopped listening between when we scheduled
+      // this and when it fired (screen disposed, retry button hit, etc).
+      if (!_shouldListen) return;
+      _log('info',
+          'partial stable for ${_partialStability.inMilliseconds}ms: "$text"');
+      _detectCommands(text, isPartial: true);
+    });
+  }
+
+  /// Match a single configured phrase (which may itself be a multi-word
+  /// expression like "go home" or "patient id is") against [lower] using
+  /// word boundaries. Returns the LAST match's location, or `null`.
+  ///
+  /// Word boundaries (`\b`) prevent substring false positives — without
+  /// them, "saving the patient" fires `save`, "stopwatch" fires `stop`,
+  /// "backside" fires `back`, etc.
+  RegExpMatch? _findLastPhraseMatch(String lower, String phrase) {
+    if (phrase.isEmpty) return null;
+    final pattern =
+        RegExp(r'\b' + RegExp.escape(phrase) + r'\b', caseSensitive: false);
+    RegExpMatch? last;
+    for (final m in pattern.allMatches(lower)) {
+      last = m;
+    }
+    return last;
+  }
+
+  void _detectCommands(String text, {bool isPartial = false}) {
+    final lower = text.toLowerCase();
+    final phrases = SettingsService.getPhrases();
+
+    // Patient ID — special-cased because it carries a payload (the spoken
+    // ID number itself). If the user says "patient id is 1-2-3", we want
+    // to capture "1-2-3" as the payload, not let some other command match
+    // win the race.
+    //
+    // Skip on partials: dedup is keyed on (command, payload), so partials
+    // like "patient id is one" then "patient id is one two" would emit
+    // *different* payloads ("1" then "12") and bypass dedup, double-firing
+    // the patient_id intent. Wait for the final.
+    if (!isPartial) {
+      final patientIdPhrase = phrases[VoiceCommand.patientId.key] ?? '';
+      RegExpMatch? bestPid;
+      String bestPidAlt = '';
+      for (final alt in _split(patientIdPhrase)) {
+        final m = _findLastPhraseMatch(lower, alt);
+        if (m == null) continue;
+        if (bestPid == null || m.end > bestPid.end) {
+          bestPid = m;
+          bestPidAlt = alt;
+        }
+      }
+      if (bestPid != null) {
+        final rest = lower.substring(bestPid.end).trim();
+        if (rest.isNotEmpty) {
+          final tail = _trimAtAnyCommand(rest, phrases);
+          final normalized = _normalizePatientId(tail);
+          if (normalized.isNotEmpty) {
+            _fire(VoiceCommand.patientId,
+                payload: normalized, raw: '$bestPidAlt $tail');
+            return;
+          }
+        }
+      }
+    }
+
+    // Other commands — pick the LATEST-occurring word-boundary match
+    // across all configured phrases. "Last spoken wins" is the right
+    // mental model here: in a mixed final like "okay actually skip", the
+    // doctor's intent is `skip`, not the `cancel` they may have said
+    // earlier in the same breath.
+    int latestEnd = -1;
+    VoiceCommand? latestCmd;
+    String latestRaw = '';
     for (final entry in phrases.entries) {
       if (entry.key == VoiceCommand.patientId.key) continue;
       final cmd = _commandFromKey(entry.key);
       if (cmd == null) continue;
       for (final alt in _split(entry.value)) {
-        if (_tailContains(lower, alt)) {
-          _fire(cmd, raw: alt);
-          return;
+        final m = _findLastPhraseMatch(lower, alt);
+        if (m == null) continue;
+        if (m.end > latestEnd) {
+          latestEnd = m.end;
+          latestCmd = cmd;
+          latestRaw = alt;
         }
       }
     }
-  }
-
-  bool _tailContains(String lower, String phrase) {
-    if (phrase.isEmpty) return false;
-    final tail = lower.length > 60 ? lower.substring(lower.length - 60) : lower;
-    return tail.contains(phrase);
+    if (latestCmd != null) {
+      _fire(latestCmd, raw: latestRaw);
+    }
   }
 
   void _fire(VoiceCommand cmd,
       {String payload = '', required String raw}) {
+    // Dedup is keyed on (command, payload). Two finals firing the same
+    // command within `_dedupWindow` are treated as a single intent — this
+    // catches the recognizer's occasional double-emission of the same
+    // utterance. Patient-ID payloads vary, so genuinely different IDs
+    // don't get suppressed.
     final key = '${cmd.key}|$payload';
     final now = DateTime.now();
     if (_lastMatched == key &&
-        now.difference(_lastMatchTime).inMilliseconds < 1500) {
+        now.difference(_lastMatchTime) < _dedupWindow) {
+      _log('info',
+          'COMMAND ${cmd.key} suppressed by dedup window (${now.difference(_lastMatchTime).inMilliseconds}ms < ${_dedupWindow.inMilliseconds}ms)');
       return;
     }
     _lastMatched = key;
@@ -439,6 +550,13 @@ class VoiceCommandService {
         'COMMAND ${cmd.key}${payload.isNotEmpty ? " payload=\"$payload\"" : ""} · triggered by "$raw"');
     _commandController.add(VoiceCommandEvent(cmd, payload: payload));
   }
+
+  /// Window for dedup of identical (cmd, payload) pairs. Bumped from the
+  /// original 1.5s to 2.2s — long enough that a delayed final emitted by
+  /// the recognizer right after we already acted on the same utterance
+  /// gets suppressed, short enough that the doctor can deliberately
+  /// repeat a command (e.g. say "next" again to advance two questions).
+  static const Duration _dedupWindow = Duration(milliseconds: 2200);
 
   VoiceCommand? _commandFromKey(String key) {
     for (final c in VoiceCommand.values) {
