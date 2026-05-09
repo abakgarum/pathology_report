@@ -41,6 +41,8 @@ class HiveStorageService {
     Hive.registerAdapter(TemplateQuestionAdapter());
     Hive.registerAdapter(TemplateSectionAdapter());
     Hive.registerAdapter(TemplateSchemaAdapter());
+    Hive.registerAdapter(IhcEntryAdapter());
+    Hive.registerAdapter(StagingSummaryAdapter());
 
     await Hive.openBox<Patient>(patientsBox);
     await Hive.openBox<PathologyReport>(reportsBox);

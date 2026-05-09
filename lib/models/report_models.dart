@@ -15,6 +15,10 @@ const int _kTemplateQuestionTypeId = 18;
 const int _kTemplateSectionTypeId = 19;
 const int _kTemplateSchemaTypeId = 20;
 
+// Structured report sub-types (CAP/RCPath-aligned synoptic data)
+const int _kIhcEntryTypeId = 21;
+const int _kStagingSummaryTypeId = 22;
+
 enum ReportStatus { draft, pending, completed }
 
 extension ReportStatusLabel on ReportStatus {
@@ -160,8 +164,36 @@ class PathologyReport {
 
   // Pathological staging string (pTNM / ypTNM, AJCC edition implied).
   // Examples: "ypT1cN1a", "pT2N0M0", "pT3aN2bM0".
-  // Optional — empty string means "no staging captured".
+  // Legacy free-text staging — kept for backward compat with reports
+  // saved before structured `staging` existed. Renderer prefers
+  // `staging` when populated, else falls back to this string.
   String pathologicStaging;
+
+  // Structured CAP-style staging summary. Rendered as the "STAGING
+  // SUMMARY" box right under the diagnosis headline.
+  StagingSummary staging;
+
+  // Ancillary / IHC table — each marker on its own row in the final
+  // report rather than buried in microscopy prose.
+  List<IhcEntry> ihcResults;
+
+  // Microscopic description, separated from the synoptic block.
+  // `microscopyImpression` becomes the SYNOPTIC SUMMARY (CAP-style
+  // "Element: Response" pairs, often filled from synopticAnswers);
+  // `microscopicDescription` is the prose paragraph describing the
+  // histology. Empty for small biopsies that only need a synoptic.
+  String microscopicDescription;
+
+  // Pathologist's COMMENT — interpretation, recommendations, MDT note,
+  // pending studies. Kept SEPARATE from the diagnosis itself per
+  // Valenstein's "diagnosis is fact, comment is interpretation" rule.
+  String comment;
+
+  // Cancer family tag — used to pick the right built-in template /
+  // synoptic schema. Empty for free-form reports.
+  // Examples: "breast_invasive", "colorectal", "prostate", "lung",
+  // "endometrial", "bladder", "melanoma", "lymph_node", "thyroid".
+  String cancerType;
 
   // Draft / raw content
   String rawTranscript;
@@ -204,6 +236,11 @@ class PathologyReport {
     this.microscopyImpression = '',
     this.diagnosisHeadline = '',
     this.pathologicStaging = '',
+    StagingSummary? staging,
+    List<IhcEntry>? ihcResults,
+    this.microscopicDescription = '',
+    this.comment = '',
+    this.cancerType = '',
     this.rawTranscript = '',
     List<VoiceRecording>? voiceRecordings,
     this.summary = '',
@@ -221,6 +258,8 @@ class PathologyReport {
   })  : id = id ?? const Uuid().v4(),
         // Default the QR UUID to a fresh v4. Caller can override for legacy reads.
         reportUuid = reportUuid ?? const Uuid().v4(),
+        staging = staging ?? StagingSummary(),
+        ihcResults = ihcResults ?? <IhcEntry>[],
         voiceRecordings = voiceRecordings ?? [],
         synopticAnswers = synopticAnswers ?? <String, dynamic>{},
         createdAt = createdAt ?? DateTime.now(),
@@ -246,6 +285,11 @@ class PathologyReport {
     String? microscopyImpression,
     String? diagnosisHeadline,
     String? pathologicStaging,
+    StagingSummary? staging,
+    List<IhcEntry>? ihcResults,
+    String? microscopicDescription,
+    String? comment,
+    String? cancerType,
     String? rawTranscript,
     List<VoiceRecording>? voiceRecordings,
     String? summary,
@@ -278,6 +322,12 @@ class PathologyReport {
       microscopyImpression: microscopyImpression ?? this.microscopyImpression,
       diagnosisHeadline: diagnosisHeadline ?? this.diagnosisHeadline,
       pathologicStaging: pathologicStaging ?? this.pathologicStaging,
+      staging: staging ?? this.staging,
+      ihcResults: ihcResults ?? this.ihcResults,
+      microscopicDescription:
+          microscopicDescription ?? this.microscopicDescription,
+      comment: comment ?? this.comment,
+      cancerType: cancerType ?? this.cancerType,
       rawTranscript: rawTranscript ?? this.rawTranscript,
       voiceRecordings: voiceRecordings ?? this.voiceRecordings,
       summary: summary ?? this.summary,
@@ -414,10 +464,24 @@ class TemplateQuestion {
 
 class TemplateSection {
   String title;
+
+  /// Routing tag for the final-report renderer:
+  ///   'synoptic' (default) — renders under SYNOPTIC SUMMARY
+  ///   'gross'              — renders under SPECIMEN & GROSS EXAMINATION
+  /// User-uploaded templates default to 'synoptic'; built-in templates
+  /// mark grossing-station sections explicitly so structured gross
+  /// data (orientation, ink, distance to margins, # nodes by station,
+  /// Quirke grade, Breslow, Gleason cores, etc.) renders in the right
+  /// section instead of being mixed into the synoptic block.
+  String kind;
+
   List<TemplateQuestion> questions;
 
-  TemplateSection({required this.title, List<TemplateQuestion>? questions})
-      : questions = questions ?? [];
+  TemplateSection({
+    required this.title,
+    this.kind = 'synoptic',
+    List<TemplateQuestion>? questions,
+  }) : questions = questions ?? [];
 }
 
 /// Parsed structure for one TemplateDocument. Keyed by [templateId] so the
@@ -452,6 +516,62 @@ class TemplateSchema {
     }
     return null;
   }
+}
+
+// ─── Structured ancillary / staging data (CAP synoptic) ─────────────────
+
+/// One row of an immunohistochemistry / ancillary studies table.
+/// Rendered as a row in the final report's "ANCILLARY STUDIES" block
+/// rather than buried inside the microscopy prose.
+class IhcEntry {
+  String marker;       // e.g. "ER", "HER2", "Ki-67", "MLH1"
+  String clone;        // e.g. "SP1", "4B5" — antibody clone (optional)
+  String result;       // e.g. "POSITIVE", "NEGATIVE", "1+", "20%"
+  String intensity;    // e.g. "Strong", "Moderate", "Weak" (optional)
+  String percent;      // e.g. "95%" (optional)
+  String note;         // free-text qualifier (optional)
+
+  IhcEntry({
+    this.marker = '',
+    this.clone = '',
+    this.result = '',
+    this.intensity = '',
+    this.percent = '',
+    this.note = '',
+  });
+
+  bool get isEmpty =>
+      marker.isEmpty && result.isEmpty && intensity.isEmpty && percent.isEmpty;
+}
+
+/// Structured pTNM staging summary. Each component is rendered on its
+/// own line in the report's "STAGING SUMMARY" box. Empty fields are
+/// hidden (so a small biopsy with only a Stage Group can still use this).
+class StagingSummary {
+  String prefix;       // p / yp / rp / a / c — usually included in pT, but may be split
+  String pT;           // e.g. "pT2", "ypT1c"
+  String pN;           // e.g. "pN1a (sn)", "pN0 (0/14)"
+  String pM;           // e.g. "pM0", "Not applicable", "pM1 (liver)"
+  String stageGroup;   // e.g. "IIB", "IIIA"
+  String ajccEdition;  // e.g. "AJCC 8th edition"
+  String additional;   // free-text extra prognostic remark (optional)
+
+  StagingSummary({
+    this.prefix = '',
+    this.pT = '',
+    this.pN = '',
+    this.pM = '',
+    this.stageGroup = '',
+    this.ajccEdition = '',
+    this.additional = '',
+  });
+
+  bool get isEmpty =>
+      pT.isEmpty &&
+      pN.isEmpty &&
+      pM.isEmpty &&
+      stageGroup.isEmpty &&
+      additional.isEmpty;
 }
 
 // ─── Hive adapters (hand-written, no code-gen) ─────────────────────────
@@ -620,6 +740,11 @@ class PathologyReportAdapter extends TypeAdapter<PathologyReport> {
     String pathologistRegistration2 = '';
     String diagnosisHeadline = '';
     String pathologicStaging = '';
+    StagingSummary staging = StagingSummary();
+    List<IhcEntry> ihcResults = <IhcEntry>[];
+    String microscopicDescription = '';
+    String comment = '';
+    String cancerType = '';
     if (reader.availableBytes > 0) reportUuid = reader.readString();
     if (reader.availableBytes > 0) {
       synopticAnswers = Map<String, dynamic>.from(reader.readMap());
@@ -629,6 +754,13 @@ class PathologyReportAdapter extends TypeAdapter<PathologyReport> {
     if (reader.availableBytes > 0) pathologistRegistration2 = reader.readString();
     if (reader.availableBytes > 0) diagnosisHeadline = reader.readString();
     if (reader.availableBytes > 0) pathologicStaging = reader.readString();
+    if (reader.availableBytes > 0) staging = reader.read() as StagingSummary;
+    if (reader.availableBytes > 0) {
+      ihcResults = (reader.readList()).cast<IhcEntry>();
+    }
+    if (reader.availableBytes > 0) microscopicDescription = reader.readString();
+    if (reader.availableBytes > 0) comment = reader.readString();
+    if (reader.availableBytes > 0) cancerType = reader.readString();
 
     return PathologyReport(
       id: id,
@@ -663,6 +795,11 @@ class PathologyReportAdapter extends TypeAdapter<PathologyReport> {
       pathologistRegistration2: pathologistRegistration2,
       diagnosisHeadline: diagnosisHeadline,
       pathologicStaging: pathologicStaging,
+      staging: staging,
+      ihcResults: ihcResults,
+      microscopicDescription: microscopicDescription,
+      comment: comment,
+      cancerType: cancerType,
     );
   }
 
@@ -701,6 +838,11 @@ class PathologyReportAdapter extends TypeAdapter<PathologyReport> {
     writer.writeString(obj.pathologistRegistration2);
     writer.writeString(obj.diagnosisHeadline);
     writer.writeString(obj.pathologicStaging);
+    writer.write(obj.staging);
+    writer.writeList(obj.ihcResults);
+    writer.writeString(obj.microscopicDescription);
+    writer.writeString(obj.comment);
+    writer.writeString(obj.cancerType);
   }
 }
 
@@ -784,16 +926,20 @@ class TemplateSectionAdapter extends TypeAdapter<TemplateSection> {
 
   @override
   TemplateSection read(BinaryReader reader) {
-    return TemplateSection(
-      title: reader.readString(),
-      questions: (reader.readList()).cast<TemplateQuestion>(),
-    );
+    final title = reader.readString();
+    final questions = (reader.readList()).cast<TemplateQuestion>();
+    // Backward-compat: `kind` was added after v1. Old schemas don't
+    // have it, so we default to 'synoptic'.
+    String kind = 'synoptic';
+    if (reader.availableBytes > 0) kind = reader.readString();
+    return TemplateSection(title: title, kind: kind, questions: questions);
   }
 
   @override
   void write(BinaryWriter writer, TemplateSection obj) {
     writer.writeString(obj.title);
     writer.writeList(obj.questions);
+    writer.writeString(obj.kind);
   }
 }
 
@@ -818,5 +964,63 @@ class TemplateSchemaAdapter extends TypeAdapter<TemplateSchema> {
     writer.writeString(obj.version);
     writer.writeList(obj.sections);
     writer.writeInt(obj.parsedAt.millisecondsSinceEpoch);
+  }
+}
+
+// ─── Structured ancillary / staging adapters ────────────────────────────
+
+class IhcEntryAdapter extends TypeAdapter<IhcEntry> {
+  @override
+  final int typeId = _kIhcEntryTypeId;
+
+  @override
+  IhcEntry read(BinaryReader reader) {
+    return IhcEntry(
+      marker: reader.readString(),
+      clone: reader.readString(),
+      result: reader.readString(),
+      intensity: reader.readString(),
+      percent: reader.readString(),
+      note: reader.readString(),
+    );
+  }
+
+  @override
+  void write(BinaryWriter writer, IhcEntry obj) {
+    writer.writeString(obj.marker);
+    writer.writeString(obj.clone);
+    writer.writeString(obj.result);
+    writer.writeString(obj.intensity);
+    writer.writeString(obj.percent);
+    writer.writeString(obj.note);
+  }
+}
+
+class StagingSummaryAdapter extends TypeAdapter<StagingSummary> {
+  @override
+  final int typeId = _kStagingSummaryTypeId;
+
+  @override
+  StagingSummary read(BinaryReader reader) {
+    return StagingSummary(
+      prefix: reader.readString(),
+      pT: reader.readString(),
+      pN: reader.readString(),
+      pM: reader.readString(),
+      stageGroup: reader.readString(),
+      ajccEdition: reader.readString(),
+      additional: reader.readString(),
+    );
+  }
+
+  @override
+  void write(BinaryWriter writer, StagingSummary obj) {
+    writer.writeString(obj.prefix);
+    writer.writeString(obj.pT);
+    writer.writeString(obj.pN);
+    writer.writeString(obj.pM);
+    writer.writeString(obj.stageGroup);
+    writer.writeString(obj.ajccEdition);
+    writer.writeString(obj.additional);
   }
 }

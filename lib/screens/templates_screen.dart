@@ -6,6 +6,7 @@ import 'package:intl/intl.dart';
 import 'package:path/path.dart' as p;
 
 import '../models/report_models.dart';
+import '../services/builtin_templates.dart';
 import '../services/hive_storage_service.dart';
 import '../services/settings_service.dart';
 import '../services/template_parser_service.dart';
@@ -102,12 +103,33 @@ class _TemplatesScreenState extends State<TemplatesScreen> {
               overflow: TextOverflow.ellipsis,
             ),
           ),
+          OutlinedButton.icon(
+            onPressed: _installBuiltIns,
+            icon: const Icon(Icons.auto_awesome_rounded, size: 18),
+            label: const Text('Install built-ins'),
+          ),
+          const SizedBox(width: 8),
           FilledButton.icon(
             onPressed: () => _openUploadDialog(),
             icon: const Icon(Icons.upload_file_rounded, size: 18),
             label: const Text('Upload template'),
           ),
         ],
+      ),
+    );
+  }
+
+  Future<void> _installBuiltIns() async {
+    final added = await installBuiltInTemplates();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          added > 0
+              ? 'Installed $added built-in template${added == 1 ? '' : 's'}.'
+              : 'Built-in templates already installed (refreshed schemas).',
+        ),
+        behavior: SnackBarBehavior.floating,
       ),
     );
   }

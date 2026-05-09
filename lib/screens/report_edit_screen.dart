@@ -30,7 +30,36 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
   late ReportStatus _status;
   late DateTime _sampleReceiptDate;
   late DateTime _reportedDate;
+  late String _cancerType;
+  // Live-edited copies of the structured tables. Built from the report on
+  // initState; serialised back on _save.
+  late List<_IhcDraft> _ihcDrafts;
   bool _dirty = false;
+
+  // Cancer-type tag for the dropdown. Drives template selection in a
+  // future iteration; today it's a free-form label only.
+  static const Map<String, String> _cancerTypes = {
+    '': '— Not specified —',
+    'breast_invasive': 'Breast — invasive carcinoma',
+    'breast_dcis': 'Breast — DCIS',
+    'colorectal': 'Colorectal carcinoma',
+    'gastric': 'Gastric carcinoma',
+    'esophageal': 'Esophageal carcinoma',
+    'liver_hcc': 'Liver / HCC',
+    'prostate': 'Prostate adenocarcinoma',
+    'bladder': 'Urothelial carcinoma',
+    'kidney': 'Renal cell carcinoma',
+    'lung': 'Lung carcinoma',
+    'endometrial': 'Endometrial carcinoma',
+    'cervical': 'Cervical carcinoma',
+    'ovarian': 'Ovarian / tubal',
+    'thyroid': 'Thyroid carcinoma',
+    'melanoma': 'Cutaneous melanoma',
+    'head_neck': 'Head & neck SCC',
+    'lymph_node': 'Lymph node / lymphoma',
+    'small_biopsy': 'Small biopsy / cores',
+    'other': 'Other',
+  };
 
   @override
   void initState() {
@@ -54,8 +83,22 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
       'grossExamination': TextEditingController(text: r.grossExamination),
       'microscopyImpression':
           TextEditingController(text: r.microscopyImpression),
+      'microscopicDescription':
+          TextEditingController(text: r.microscopicDescription),
       'diagnosisHeadline':
           TextEditingController(text: r.diagnosisHeadline),
+      'comment': TextEditingController(text: r.comment),
+      // Structured staging — one controller per pTNM component.
+      'pT': TextEditingController(text: r.staging.pT),
+      'pN': TextEditingController(text: r.staging.pN),
+      'pM': TextEditingController(text: r.staging.pM),
+      'stageGroup': TextEditingController(text: r.staging.stageGroup),
+      'stagingPrefix': TextEditingController(text: r.staging.prefix),
+      'ajccEdition': TextEditingController(text: r.staging.ajccEdition),
+      'stagingAdditional':
+          TextEditingController(text: r.staging.additional),
+      // Legacy free-text staging — preserved as a fallback for older
+      // reports (the renderer prefers the structured fields above).
       'pathologicStaging':
           TextEditingController(text: r.pathologicStaging),
       'summary': TextEditingController(text: r.summary),
@@ -69,6 +112,8 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
     _status = r.status;
     _sampleReceiptDate = r.sampleReceiptDate;
     _reportedDate = r.reportedDate;
+    _cancerType = r.cancerType;
+    _ihcDrafts = r.ihcResults.map(_IhcDraft.fromEntry).toList();
 
     for (final ctrl in _c.values) {
       ctrl.addListener(() {
@@ -82,11 +127,27 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
     for (final ctrl in _c.values) {
       ctrl.dispose();
     }
+    for (final d in _ihcDrafts) {
+      d.dispose();
+    }
     super.dispose();
   }
 
   Future<void> _save() async {
     final ageText = _c['patientAge']!.text.trim();
+    final staging = StagingSummary(
+      prefix: _c['stagingPrefix']!.text.trim(),
+      pT: _c['pT']!.text.trim(),
+      pN: _c['pN']!.text.trim(),
+      pM: _c['pM']!.text.trim(),
+      stageGroup: _c['stageGroup']!.text.trim(),
+      ajccEdition: _c['ajccEdition']!.text.trim(),
+      additional: _c['stagingAdditional']!.text.trim(),
+    );
+    final ihc = _ihcDrafts
+        .map((d) => d.toEntry())
+        .where((e) => !e.isEmpty)
+        .toList();
     final updated = widget.report.copyWith(
       reportNumber: _c['reportNumber']!.text.trim(),
       patientId: _c['patientId']!.text.trim(),
@@ -102,8 +163,14 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
       specimen: _c['specimen']!.text.trim(),
       grossExamination: _c['grossExamination']!.text.trim(),
       microscopyImpression: _c['microscopyImpression']!.text.trim(),
+      microscopicDescription:
+          _c['microscopicDescription']!.text.trim(),
       diagnosisHeadline: _c['diagnosisHeadline']!.text.trim(),
       pathologicStaging: _c['pathologicStaging']!.text.trim(),
+      staging: staging,
+      ihcResults: ihc,
+      comment: _c['comment']!.text.trim(),
+      cancerType: _cancerType,
       summary: _c['summary']!.text.trim(),
       pathologistName: _c['pathologistName']!.text.trim(),
       pathologistRegistration:
@@ -189,6 +256,12 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
                   _headerCard(),
                   const SizedBox(height: 16),
                   _datesCard(),
+                  const SizedBox(height: 16),
+                  _diagnosisCard(),
+                  const SizedBox(height: 16),
+                  _stagingCard(),
+                  const SizedBox(height: 16),
+                  _ihcCard(),
                   const SizedBox(height: 16),
                   _sectionsCard(),
                   const SizedBox(height: 16),
@@ -332,30 +405,193 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
   Widget _sectionsCard() {
     return _card(
       icon: Icons.description_rounded,
-      title: 'Report sections',
+      title: 'Report body',
       child: Column(
         children: [
           _field('clinicalInformation', 'Clinical information', maxLines: 3),
-          const SizedBox(height: 12),
-          // Diagnosis-first fields rendered together so the doctor edits
-          // them as a logical pair — what the report opens with.
-          _field('diagnosisHeadline',
-              'Histopathology diagnosis (top-of-report headline)',
-              maxLines: 4),
-          const SizedBox(height: 12),
-          _field('pathologicStaging', 'Pathologic staging (pTNM / ypTNM)',
-              maxLines: 1),
           const SizedBox(height: 12),
           _field('specimen', 'Specimen', maxLines: 3),
           const SizedBox(height: 12),
           _field('grossExamination', 'Gross examination', maxLines: 5),
           const SizedBox(height: 12),
-          _field('microscopyImpression', 'Microscopy (synoptic block)',
-              maxLines: 6),
+          _field('microscopicDescription',
+              'Microscopic description (prose)',
+              maxLines: 5),
           const SizedBox(height: 12),
-          _field('summary', 'Clinical summary', maxLines: 3),
+          _field('microscopyImpression',
+              'Microscopy / synoptic free-text (legacy fallback)',
+              maxLines: 5),
+          const SizedBox(height: 12),
+          _field('comment', 'Comment / interpretation / MDT note',
+              maxLines: 4),
+          const SizedBox(height: 12),
+          _field('summary', 'Clinical summary (legacy)', maxLines: 2),
         ],
       ),
+    );
+  }
+
+  /// Cancer type + diagnosis headline. The headline is the report's
+  /// visual anchor (rendered top-of-page), so it gets its own card
+  /// instead of being buried in the section list.
+  Widget _diagnosisCard() {
+    return _card(
+      icon: Icons.center_focus_strong_rounded,
+      title: 'Diagnosis',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          DropdownButtonFormField<String>(
+            value: _cancerType.isEmpty ? '' : _cancerType,
+            isDense: true,
+            decoration: const InputDecoration(
+              labelText: 'Cancer type / specimen family',
+              isDense: true,
+            ),
+            items: _cancerTypes.entries
+                .map((e) => DropdownMenuItem(
+                    value: e.key, child: Text(e.value)))
+                .toList(),
+            onChanged: (v) => setState(() {
+              _cancerType = v ?? '';
+              _dirty = true;
+            }),
+          ),
+          const SizedBox(height: 12),
+          _field('diagnosisHeadline',
+              'Final diagnosis (rendered as the FINAL DIAGNOSIS box)',
+              maxLines: 5),
+        ],
+      ),
+    );
+  }
+
+  /// Pathologic staging — structured pT/pN/pM/Stage Group editor.
+  /// The legacy `pathologicStaging` free-text field is kept at the
+  /// bottom as a fallback for old reports / non-AJCC schemes.
+  Widget _stagingCard() {
+    return _card(
+      icon: Icons.numbers_rounded,
+      title: 'Pathologic staging',
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Expanded(child: _field('pT', 'pT')),
+              const SizedBox(width: 12),
+              Expanded(child: _field('pN', 'pN')),
+              const SizedBox(width: 12),
+              Expanded(child: _field('pM', 'pM')),
+              const SizedBox(width: 12),
+              Expanded(child: _field('stageGroup', 'Stage group')),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                  child:
+                      _field('stagingPrefix', 'Prefix (p / yp / rp / a)')),
+              const SizedBox(width: 12),
+              Expanded(
+                  child:
+                      _field('ajccEdition', 'AJCC edition (e.g. 8th)')),
+            ],
+          ),
+          const SizedBox(height: 12),
+          _field('stagingAdditional',
+              'Additional prognostic remark (optional)', maxLines: 2),
+          const SizedBox(height: 12),
+          _field('pathologicStaging',
+              'Legacy free-text staging (used only if structured fields above are blank)'),
+        ],
+      ),
+    );
+  }
+
+  /// IHC / ancillary studies table editor. Each row is a draft with
+  /// its own controllers. Add / remove rows below the table.
+  Widget _ihcCard() {
+    return _card(
+      icon: Icons.science_rounded,
+      title: 'Ancillary studies — IHC',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (_ihcDrafts.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 16),
+              child: Text(
+                'No IHC rows yet — add a marker below.',
+                style: TextStyle(
+                    fontSize: 12.5, color: AppColors.textHint),
+              ),
+            )
+          else
+            for (var i = 0; i < _ihcDrafts.length; i++) ...[
+              _ihcRow(i),
+              if (i < _ihcDrafts.length - 1)
+                const Divider(height: 24),
+            ],
+          const SizedBox(height: 12),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: OutlinedButton.icon(
+              onPressed: () => setState(() {
+                _ihcDrafts.add(_IhcDraft());
+                _dirty = true;
+              }),
+              icon: const Icon(Icons.add_rounded, size: 18),
+              label: const Text('Add IHC marker'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _ihcRow(int i) {
+    final d = _ihcDrafts[i];
+    Widget cell(TextEditingController c, String label,
+        {int flex = 1, int maxLines = 1}) {
+      return Expanded(
+        flex: flex,
+        child: TextField(
+          controller: c,
+          minLines: 1,
+          maxLines: maxLines,
+          decoration: InputDecoration(
+            labelText: label,
+            isDense: true,
+          ),
+          onChanged: (_) {
+            if (!_dirty) setState(() => _dirty = true);
+          },
+        ),
+      );
+    }
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        cell(d.marker, 'Marker', flex: 3),
+        const SizedBox(width: 8),
+        cell(d.clone, 'Clone', flex: 2),
+        const SizedBox(width: 8),
+        cell(d.result, 'Result', flex: 4),
+        const SizedBox(width: 8),
+        cell(d.intensity, 'Intensity', flex: 2),
+        const SizedBox(width: 8),
+        cell(d.percent, '% cells', flex: 2),
+        IconButton(
+          tooltip: 'Remove row',
+          onPressed: () => setState(() {
+            _ihcDrafts.removeAt(i).dispose();
+            _dirty = true;
+          }),
+          icon: const Icon(Icons.delete_outline_rounded, size: 20),
+        ),
+      ],
     );
   }
 
@@ -541,5 +777,58 @@ class _ReportEditScreenState extends State<ReportEditScreen> {
             style: const TextStyle(fontSize: 14)),
       ),
     );
+  }
+}
+
+/// One row of the IHC table while it's being edited. Each draft owns
+/// its own controllers so typing in row N doesn't rebuild rows 0..N-1.
+/// Converted to/from `IhcEntry` at load and save time.
+class _IhcDraft {
+  final TextEditingController marker;
+  final TextEditingController clone;
+  final TextEditingController result;
+  final TextEditingController intensity;
+  final TextEditingController percent;
+  final TextEditingController note;
+
+  _IhcDraft({
+    String marker = '',
+    String clone = '',
+    String result = '',
+    String intensity = '',
+    String percent = '',
+    String note = '',
+  })  : marker = TextEditingController(text: marker),
+        clone = TextEditingController(text: clone),
+        result = TextEditingController(text: result),
+        intensity = TextEditingController(text: intensity),
+        percent = TextEditingController(text: percent),
+        note = TextEditingController(text: note);
+
+  factory _IhcDraft.fromEntry(IhcEntry e) => _IhcDraft(
+        marker: e.marker,
+        clone: e.clone,
+        result: e.result,
+        intensity: e.intensity,
+        percent: e.percent,
+        note: e.note,
+      );
+
+  IhcEntry toEntry() => IhcEntry(
+        marker: marker.text.trim(),
+        clone: clone.text.trim(),
+        result: result.text.trim(),
+        intensity: intensity.text.trim(),
+        percent: percent.text.trim(),
+        note: note.text.trim(),
+      );
+
+  void dispose() {
+    marker.dispose();
+    clone.dispose();
+    result.dispose();
+    intensity.dispose();
+    percent.dispose();
+    note.dispose();
   }
 }
