@@ -48,9 +48,25 @@ class HiveStorageService {
     await Hive.openBox<PathologyReport>(reportsBox);
     await Hive.openBox(draftsBox); // dynamic map
     await Hive.openBox<TemplateDocument>(templatesBox);
-    await Hive.openBox<TemplateSchema>(templateSchemasBox);
+    await _openCacheBox<TemplateSchema>(templateSchemasBox);
 
     _initialized = true;
+  }
+
+  /// Open a *derived-cache* box, recovering from a corrupt or stale-format
+  /// file by dropping it and reopening empty. Only safe for boxes whose
+  /// contents can be regenerated (here: parsed template schemas, rebuilt by
+  /// `installBuiltInTemplates()` and template parsing). Never use this for
+  /// boxes holding original user data — a transient error would wipe it.
+  static Future<Box<T>> _openCacheBox<T>(String name) async {
+    try {
+      return await Hive.openBox<T>(name);
+    } catch (e) {
+      debugPrint(
+          'HiveStorageService: dropping unreadable cache box "$name" ($e)');
+      await Hive.deleteBoxFromDisk(name);
+      return await Hive.openBox<T>(name);
+    }
   }
 
   // ─── Patient operations ─────────────────────────────────────────

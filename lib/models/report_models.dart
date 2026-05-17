@@ -926,12 +926,17 @@ class TemplateSectionAdapter extends TypeAdapter<TemplateSection> {
 
   @override
   TemplateSection read(BinaryReader reader) {
+    // Fixed positional layout. `kind` must be read unconditionally: a
+    // `TemplateSection` is a list element inside `TemplateSchema`, so
+    // `reader.availableBytes` reflects the whole frame (following sections
+    // + trailing `parsedAt`), never just this object — the availableBytes
+    // optional-field trick only works for the last field of a top-level
+    // value. Old schemas written before `kind` can't be read with this
+    // layout; the `template_schemas` cache box is dropped & rebuilt on a
+    // format error in HiveStorageService.init.
     final title = reader.readString();
     final questions = (reader.readList()).cast<TemplateQuestion>();
-    // Backward-compat: `kind` was added after v1. Old schemas don't
-    // have it, so we default to 'synoptic'.
-    String kind = 'synoptic';
-    if (reader.availableBytes > 0) kind = reader.readString();
+    final kind = reader.readString();
     return TemplateSection(title: title, kind: kind, questions: questions);
   }
 
